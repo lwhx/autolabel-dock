@@ -219,7 +219,7 @@ class LabelPanel(QWidget):
         # Wire view → shell signals
         self._view.status_changed.connect(self.status_changed.emit)
         self._view.images_dropped.connect(self._on_images_dropped)
-        self._view.classes_changed.connect(self._refresh_class_filter)
+        self._view.classes_changed.connect(self._on_view_classes_changed)
         self._view.user_tags_changed.connect(self._on_view_user_tags_changed)
 
         # Push project state to the view
@@ -237,6 +237,14 @@ class LabelPanel(QWidget):
 
         self._refresh_btn.setEnabled(True)
         logger.info("Project loaded: %s (task=%s)", project.config.name, task_type)
+
+    def _on_view_classes_changed(self) -> None:
+        """View mutated project.config.classes on the fly (new class drawn /
+        added). Re-sync every widget that mirrors the class list — the class
+        filter combo AND the LocateAnything 目标类别 dropdown."""
+        self._refresh_class_filter()
+        if self._project is not None:
+            self._la_bar.set_classes(self._project.config.classes)
 
     def _refresh_class_filter(self) -> None:
         """Rebuild the class filter combo from the current project's classes.
