@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 
 from PyQt5.QtWidgets import (
     QWidget,
@@ -39,6 +40,33 @@ from src.ui.tag_widget import TagFilterBar
 from src.ui.theme import PALETTE, set_button_role, text_style
 
 logger = logging.getLogger(__name__)
+
+
+def _detect_available_devices() -> list[str]:
+    """Return device options for the training combo box.
+
+    Always starts with "auto" (maps to "" at train time, letting Ultralytics
+    pick the best available device). Then appends detected accelerators:
+    CUDA GPUs by index on Linux/Windows, MPS on macOS Apple Silicon.
+    Always ends with "cpu".
+    """
+    devices = ["auto"]
+    try:
+        import torch
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                name = torch.cuda.get_device_name(i)
+                devices.append(f"{i}")
+                logger.debug("Detected CUDA device %d: %s", i, name)
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            devices.append("mps")
+            logger.debug("Detected MPS (Apple Silicon) device")
+    except ImportError:
+        if sys.platform == "darwin":
+            devices.append("mps")
+    devices.append("cpu")
+    return devices
+
 
 # Default pretrained models per task
 _TASK_MODELS: dict[str, list[str]] = {
@@ -201,7 +229,7 @@ class TrainPanel(QWidget):
 
         self._device_combo = QComboBox()
         self._device_combo.setEditable(True)
-        self._device_combo.addItems(["", "0", "1", "cpu"])
+        self._device_combo.addItems(_detect_available_devices())
         task_form.addRow("设备:", self._device_combo)
 
         self._preset_combo = QComboBox()
@@ -888,7 +916,10 @@ class TrainPanel(QWidget):
                 getattr(self, _BOOL_FIELD_MAP[key]).setChecked(bool(value))
             elif key in _COMBO_FIELD_MAP:
                 combo = getattr(self, _COMBO_FIELD_MAP[key])
-                combo.setCurrentText(str(value) if value is not None else "")
+                text = str(value) if value is not None else ""
+                if key == "device" and text == "":
+                    text = "auto"
+                combo.setCurrentText(text)
             elif key == "freeze":
                 self._set_freeze_value(value)
             elif key == "auto_augment":
@@ -991,7 +1022,7 @@ class TrainPanel(QWidget):
             epochs=self._epochs_spin.value(),
             batch=self._batch_spin.value(),
             imgsz=self._imgsz_spin.value(),
-            device=self._device_combo.currentText(),
+            device=self._device_combo.currentText() if self._device_combo.currentText() != "auto" else "",
             freeze=None if self._freeze_default_check.isChecked() else self._freeze_spin.value(),
             workers=self._workers_spin.value(),
             patience=self._patience_spin.value(),
