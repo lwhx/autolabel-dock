@@ -818,6 +818,8 @@ class DetectPoseView(TaskView):
             return
         paths = list(paths)
 
+        # Flush in-memory edits first so the labeled-count below is accurate.
+        self._save_current()
         labeled_count = 0
         for p in paths:
             ia = load_annotation(self._project.label_path_for(p))
@@ -840,7 +842,6 @@ class DetectPoseView(TaskView):
         if reply != QMessageBox.Yes:
             return
 
-        self._save_current()
         current_in_deleted = (
             self._current_image_path is not None
             and self._current_image_path in paths
@@ -892,6 +893,10 @@ class DetectPoseView(TaskView):
         if not visible_paths:
             return
 
+        # Flush the focused image's in-memory annotations to disk BEFORE
+        # scanning label JSONs, so its pending annotations are counted and
+        # confirmed too (and the stale disk copy can't overwrite unsaved edits).
+        self._save_current()
         affected, total = self._collect_unconfirmed(visible_paths)
         if total == 0:
             self.status_changed.emit("没有需要确认的预标注")
@@ -905,7 +910,6 @@ class DetectPoseView(TaskView):
         if reply != QMessageBox.Yes:
             return
 
-        self._save_current()
         count = 0
         for img_path, label_path, ia in affected:
             old_snap = self._stats_snapshot(ia.annotations)
@@ -929,6 +933,8 @@ class DetectPoseView(TaskView):
         if not visible_paths:
             return
 
+        # Same ordering constraint as _batch_confirm_visible: flush before scan.
+        self._save_current()
         affected, total = self._collect_unconfirmed(visible_paths)
         if total == 0:
             self.status_changed.emit("没有需要撤销的预标注")
@@ -942,7 +948,6 @@ class DetectPoseView(TaskView):
         if reply != QMessageBox.Yes:
             return
 
-        self._save_current()
         count = 0
         for img_path, label_path, ia in affected:
             old_snap = self._stats_snapshot(ia.annotations)

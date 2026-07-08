@@ -633,6 +633,56 @@ class TestMainWindow:
         assert view._canvas.annotations[0].confirmed is True
         win.close()
 
+    def test_confirm_visible_includes_unsaved_current_image(self, qapp, tmp_path, monkeypatch):
+        """Regression: 确认可见预标注 must confirm the focused image's pending annotations.
+
+        Bug: _batch_confirm_visible scanned label JSONs on disk BEFORE calling
+        _save_current(). Predictions added in-memory by single auto-label
+        (add_auto_annotations) were not on disk yet, so the current image was
+        excluded from the affected list and its annotations stayed unconfirmed
+        after reload_current().
+        """
+        from src.app import MainWindow
+        from src.core.annotation import Annotation
+        from src.core.label_io import load_annotation
+        from src.core.project import ProjectManager
+        from PyQt5.QtGui import QImage
+        from PyQt5.QtWidgets import QMessageBox
+
+        pm = ProjectManager.create(
+            tmp_path / "proj", "det", classes=["cat"], task_type="detect",
+        )
+        img_dir = pm.project_dir / pm.config.image_dir
+        img_path = img_dir / "img0.png"
+        QImage(40, 40, QImage.Format_RGB32).save(str(img_path), "PNG")
+
+        win = MainWindow(config_path=tmp_path / "config.json")
+        win.open_project(pm)
+
+        view = win._label_panel._view
+        assert view._current_image_path == img_path
+
+        # Simulate single auto-label: in-memory only, nothing on disk yet.
+        view.add_auto_annotations([Annotation(
+            class_id=0, class_name="cat",
+            bbox=(0.5, 0.5, 0.2, 0.2),
+            confirmed=False, source="auto",
+        )])
+        assert load_annotation(pm.label_path_for(img_path)) is None
+
+        monkeypatch.setattr(
+            "src.ui.views.detect_pose.QMessageBox.question",
+            lambda *a, **k: QMessageBox.Yes,
+        )
+        view._batch_confirm_visible()
+
+        ia = load_annotation(pm.label_path_for(img_path))
+        assert ia is not None and len(ia.annotations) == 1
+        assert ia.annotations[0].confirmed is True, \
+            "confirm-visible skipped the current image's unsaved pending annotations"
+        assert view._canvas.annotations[0].confirmed is True
+        win.close()
+
     def test_batch_classify_summary_includes_failed_count(self, qapp, tmp_path):
         """Bug #9: classify batch must surface count of unidentified images."""
         from src.app import MainWindow

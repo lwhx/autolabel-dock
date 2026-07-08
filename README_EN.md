@@ -1,6 +1,6 @@
 # AutoLabel Dock
 
-> Label a few, train a round, auto-label the rest — a desktop image-annotation and YOLO-training iteration loop.
+> An iterative closed-loop desktop tool for image annotation and YOLO training — annotate a few, train a model, auto-label the rest.
 
 ![Python](https://badgen.net/badge/Python/%E2%89%A53.10/blue)
 ![License](https://badgen.net/badge/License/AGPL--3.0/green)
@@ -8,255 +8,190 @@
 
 **English** | [简体中文](README.md)
 
-AutoLabel Dock is a desktop image-annotation tool built on **PyQt5 + Ultralytics YOLOv8**. It runs cross-platform on Linux / macOS / Windows.
 
-It turns "annotation" and "training" into a single closed loop: label a batch of images manually (or with help from an existing model), confirm the results, train a custom YOLO model in one click, then use the new model to auto-label the rest of your data — every iteration leaves fewer boxes to fix by hand.
 
-> Note: the application UI is currently Chinese-only; this English README documents the project for international users.
+AutoLabel Dock is a desktop image annotation tool built with **PyQt5 + Ultralytics**, featuring a fully Chinese UI, and runs cross-platform on Linux / macOS / Windows.
+
+It turns "annotation" and "training" into an iterative closed loop: manually (or with existing model assistance) annotate a batch of images, confirm them, then train a custom YOLO model with one click. Use the new model to continue auto-labeling the remaining data — with each iteration, fewer manual corrections are needed.
 
 ![AutoLabel Dock](resources/screenshots/overall.png)
 
----
 
-## Screenshots
+<details>
+<summary><b>Screenshots</b></summary>
 
 | Panel | Screenshot |
 |:---|:---:|
-| Annotation (detect/pose) | ![Annotation UI](resources/screenshots/labeling.png) |
+| Annotation (Detection / Keypoint) | ![Annotation UI](resources/screenshots/labeling.png) |
 | Classification | ![Classification UI](resources/screenshots/cls.png) |
 | LocateAnything | ![LA UI](resources/screenshots/locateanything.png) |
-| Training panel | ![Training panel](resources/screenshots/train.png) |
-| Model management | ![Model management](resources/screenshots/models.png) |
-
----
-
-## Features
-
-### 🔍 Three annotation tasks
-
-- **Object detection (detect)**: bounding-box (bbox) annotation
-- **Keypoint pose (pose)**: bbox + skeleton keypoints
-- **Image classification (classify)**: single label per image, with a grid selector and `1`–`9` hotkeys for quick labeling that auto-advances to the next image
-
-### ✏️ Annotation experience
-
-- Keyboard-centric workflow similar to LabelImg
-- Smooth canvas: bbox drawing, keypoint placement, drag-to-move/resize, scroll-wheel zoom and pan; viewport culling keeps it smooth with large numbers of annotations
-- Per-image undo stack (depth 50), auto-save on image switch, LRU image cache
-- File list color-coded by status (confirmed / pending / unlabeled), with drag-and-drop image import, combined status + class + tag filtering, and right-click batch operations
-- Catppuccin Mocha dark theme
-
-<details>
-<summary><b>Keyboard shortcuts</b></summary>
-
-**Tools & modes**
-
-| Shortcut | Function |
-|:---|:---|
-| `W` | Box drawing mode |
-| `K` | Keypoint mode |
-| `V` | Select/move mode |
-
-**Navigation**
-
-| Shortcut | Function |
-|:---|:---|
-| `A` / `←` | Previous image (auto-saves current) |
-| `D` / `→` | Next image (auto-saves current) |
-
-**Annotation operations**
-
-| Shortcut | Function |
-|:---|:---|
-| `Space` | Confirm selected annotation |
-| `Delete` | Delete selected annotation |
-| `Ctrl+Z` / `Ctrl+Y` | Undo / Redo |
-| `Ctrl+C` / `Ctrl+V` | Copy / paste annotations |
-| `Ctrl+S` | Save |
-
-**View**
-
-| Shortcut | Function |
-|:---|:---|
-| `Ctrl++` / `Ctrl+-` | Zoom in / out |
-| `Ctrl+0` | Fit to window |
-| `F5` | Rescan image directory |
-
-**Classification only**
-
-| Shortcut | Function |
-|:---|:---|
-| `1`–`9` | Quick-select class label |
+| Training Panel | ![Training Panel](resources/screenshots/train.png) |
+| Model Panel | ![Model Management](resources/screenshots/models.png) |
 
 </details>
 
-### 🤖 Model-assisted auto-labeling
+---
 
-- Load any YOLO weights to pre-label a single image or a batch (batches run on a background thread and save to disk image by image)
-- Conflict detection: predictions are matched against existing confirmed same-class annotations by IoU to avoid duplicate boxes
-- Confirmation lifecycle: auto-labels start as "pending" (dashed boxes); any manual edit marks them confirmed; once every box on an image is confirmed, the canvas locks to prevent accidental edits
-- Optional LocateAnything-3B text-labeling backend lets you describe targets in natural language (see [Optional: LocateAnything Text Labeling](#optional-locateanything-text-labeling))
+## ✨ Features
 
-### 🏷️ Tag subsystem
-
-- Attach custom tags to images (independent of classification labels) for dataset organization
-- Tri-state filter chips (none → include → exclude), with AND/OR combination when multiple include tags are selected
-- Select multiple images and press `T` to tag them in bulk
-- The same tag filter can scope the training subset at train time
-
-### 🔄 Training loop
-
-- One-click dataset preparation: stratified train/val split by primary class, zero-copy via symlinks (with automatic fallback on Windows — see [Platform Notes](#platform-notes))
-- Training presets plus full hyperparameter control; live loss / mAP curves; cancellable mid-run
-- On completion the model is auto-registered to the model library and auto-loaded, ready for inference immediately
-
-### 📦 Model management
-
-- Model library: training outputs are registered automatically; import external weights, rename, and delete are supported
-- Multi-model metric comparison dialog
-
-### 📥 Data import / export
-
-| Format | Export | Import | Applicable tasks |
-|:---|:---:|:---:|:---|
-| YOLO (txt) | ✅ | ✅ | Detection / Pose |
-| COCO (json) | ✅ | ✅ | Detection / Pose |
-| labelme (json) | ✅ | ✅ | Detection / Pose |
-| ImageFolder | ✅ | ✅ | Classification (folder-per-class) |
-| CSV | ✅ | ❌ | Classification |
-
-### 🛡️ Data safety
-
-- **Automatic backups**: destructive operations such as export and class changes snapshot to the in-project `.backups/` first, keeping the latest 20; a safety backup is also taken before any restore
-- **Independent storage**: annotations are stored as one JSON file per image, so a single corrupt file doesn't affect the rest
-- **Global config**: recent projects, window geometry, thresholds, etc. are stored under `~/.autolabel/`
+- **Three task types** — Object detection (bounding boxes), pose estimation (bounding boxes + keypoint skeletons), image classification (whole-image labels, tag in seconds with `1`–`9`, auto-advances to next image).
+- **Keyboard-driven manual annotation** — `W` to draw boxes, `K` to place keypoints, `A`/`D` to switch images, `Space` to confirm; drag to move/resize, scroll to zoom/pan; per-image undo stack, auto-save on image switch.
+- **Model-assisted annotation** — Load any YOLOv8 weights for single-image or full-project batch pre-annotation. Pre-annotations appear as yellow dashed "pending" shapes and only count after manual confirmation; overlapping predictions with confirmed annotations are auto-deduplicated by IoU.
+- **Text-prompt annotation (optional)** — Integrates NVIDIA LocateAnything-3B for open-vocabulary detection. Describe targets in natural language (e.g., "red hard hat") for pre-annotation without pre-training. The model runs in a separate child process with automatic VRAM management and releases resources on close. (See [Optional: LocateAnything Text Annotation](#optional-locateanything-text-annotation))
+- **Built-in training** — One-click YOLO-format dataset generation from confirmed annotations (stratified train/val split), parameter presets, data augmentation preview, real-time loss/mAP curves; auto-registers and loads the trained model for the next annotation round. Zero-copy via symbolic links (auto-degrades on Windows, see [Platform Notes](#platform-notes)).
+- **Dataset management** — File list color-coded by annotation status, triple filtering by status / category / labels; apply custom tags to images, filter training subsets by tag; automatic backups before critical operations, rollback anytime.
+- **Model management** — Model registry, multi-model metric comparison, model structure viewer (layer-by-layer parameter counts and output shapes to help choose `freeze` layers), import external `.pt` files.
+- **Utility panel** — Write and run Python scripts directly within the app (working directory is the current project), handling tasks like batch renaming and data cleaning without switching tools.
 
 ---
 
-## Quick Start
+## 🚀 Quick Start
 
-```
-1. Create project  →  2. Import images  →  3. Annotate  →  4. Confirm  →  5. Train  →  6. Iterate ↻
-```
-
-1. **Create a project**: pick the task type (detection / pose / classification), specify the project directory (the project will automatically scan and load `images/labels`), or leave it blank and drag images in later
-2. **Import images**: drag images onto the file list (you can also add images to the project's `images/` directory later and press `F5` to refresh)
-3. **Annotate**: draw manually; or load a YOLO weight to pre-label automatically; or use the LocateAnything text-labeling backend to describe targets in natural language (see [Optional: LocateAnything Text Labeling](#optional-locateanything-text-labeling))
-4. **Confirm**: review auto-labels image by image — editing confirms them
-5. **Train**: prepare the dataset and start training in one click, watching the curves live
-6. **Iterate**: the freshly trained model auto-loads, ready to auto-label the remaining images
-
----
-
-## Requirements
+### Requirements
 
 - Python ≥ 3.10
-- OS: Linux / macOS / Windows
+- NVIDIA GPU recommended for training and inference (CPU-only works, but is slower)
+- Text-prompt annotation requires an NVIDIA GPU with ≥ 6 GB VRAM
 
-## Installation
-
-The core dependencies are light: **PyQt5** (UI) and **Ultralytics** (YOLO inference/training), plus a few smaller libraries such as pyqtgraph (training curves) — see `requirements.txt` for the full list.
-
-Using Miniconda to create an isolated environment is recommended:
+### Installation & Running
 
 ```bash
 git clone https://github.com/xzcGit/autolabel-dock.git
 cd autolabel-dock
+
+# Recommended: use an isolated environment
 conda create -n autolabel python=3.10 -y
 conda activate autolabel
+
 pip install -r requirements.txt
-```
-
-The optional LocateAnything-3B text-labeling backend is large and installed on demand; see the enablement requirements in [Optional: LocateAnything Text Labeling](#optional-locateanything-text-labeling).
-
-## Running
-
-```bash
 python main.py
 ```
 
-## Model Weights
+> 💡 For GPU training, first install a CUDA-compatible torch following the [PyTorch website](https://pytorch.org/get-started/locally/) instructions, then install the remaining dependencies.
+> Training base models (e.g., `yolov8n.pt`) are auto-downloaded by Ultralytics on first use. For offline environments, download them in advance and place them in the repo root.
 
-This project **does not ship any model weights**. Official YOLO pretrained models (`yolov8n.pt`, `yolov8s.pt`, `yolo26n.pt`, etc.) are downloaded automatically by Ultralytics the first time the related feature is used; if the automatic download fails, manually download the corresponding `.pt` file into the repository root (`autolabel-dock/`). See the next section for how to obtain the LocateAnything-3B weights.
+## Optional: LocateAnything Text Annotation
 
-## Optional: LocateAnything Text Labeling
+LocateAnything-3B is an optional open-vocabulary detection backend that lets you describe targets in natural language. All other features work normally without it. Enabling it requires all three conditions below; if any is unmet, the UI shows a hint without affecting the app:
 
-LocateAnything-3B is an optional open-vocabulary detection backend that lets you describe targets in natural language. The rest of the app works perfectly fine without it. Enabling it requires **all three** of the following conditions; if any is unmet, the UI shows a message (in Chinese) and the rest of the app is unaffected:
+<details>
+<summary><b>View details</b></summary>
 
-**1. Install the optional dependencies**
+**1. Install optional dependencies**
 
 ```bash
 pip install -e ".[locateanything]"
 ```
 
-This additionally installs transformers, accelerate, bitsandbytes, and decord (the base install does not include these heavy dependencies).
+This additionally installs transformers, accelerate, bitsandbytes, and decord (not included in the base installation).
 
-**2. Download the model weights in advance**
+**2. Download model weights in advance**
 
-At runtime the model is loaded in offline mode (`HF_HUB_OFFLINE=1`) and is **not** downloaded automatically, so you must download `nvidia/LocateAnything-3B` into the local HuggingFace cache beforehand:
+The runtime loads with offline mode (`HF_HUB_OFFLINE=1`) and will **not auto-download**. You must manually download `nvidia/LocateAnything-3B` to your local HuggingFace cache:
 
 ```bash
 hf download nvidia/LocateAnything-3B
 # Legacy tool: huggingface-cli download nvidia/LocateAnything-3B
 ```
 
-The default cache location is `~/.cache/huggingface/hub`; `$HF_HOME` and `$HUGGINGFACE_HUB_CACHE` are also honored.
+The default cache location is `~/.cache/huggingface/hub`. Custom paths can be set via `$HF_HOME` or `$HUGGINGFACE_HUB_CACHE`.
 
-**3. GPU memory**
+**3. GPU VRAM**
 
-An NVIDIA GPU with a working `nvidia-smi` is required — **CPU is not supported**; total VRAM must be ≥ 6GB and free VRAM ≥ 5GB at enable time (on a single-GPU machine the desktop display also consumes VRAM, hence the relatively high free-memory threshold).
+Requires an NVIDIA GPU with `nvidia-smi` available; **CPU is not supported**. Total VRAM ≥ 6 GB, and idle VRAM ≥ 5 GB at launch (desktop display also consumes VRAM on single-GPU machines, hence the higher idle threshold).
 
-> Additionally: LocateAnything and YOLO models never occupy the GPU at the same time — enabling LocateAnything automatically unloads the loaded YOLO model, and the reverse (loading a YOLO model or starting training) prompts you to confirm disabling LocateAnything first. It runs in a separate subprocess, isolated from the main UI process.
+> Also: LocateAnything and YOLO models never occupy GPU simultaneously — enabling LocateAnything auto-unloads any loaded YOLO model; the reverse (loading a YOLO model or starting training) first prompts for confirmation to close LocateAnything. It runs in a separate child process, isolated from the main UI process.
+
+</details>
+
+---
+
+## 📖 Basic Workflow
+
+```
+1. Create Project  →  2. Import Images  →  3. Annotate  →  4. Confirm  →  5. Train  →  6. Iterate ↻
+```
+
+1. **Create Project**: Choose task type (detection / pose / classification), specify a project directory (the project auto-scans and loads images/labels), or leave empty and use the next step to drag in images.
+2. **Import Images**: Drag and drop into the window (or later place them into the project `images/` directory and refresh the list); existing annotations can be imported via `Ctrl+I` from YOLO / COCO / labelme formats.
+3. **Annotate**: Draw manually; or load YOLO weights for auto pre-annotation; or optionally use the LocateAnything text annotation backend to describe targets in natural language (see [Optional: LocateAnything Text Annotation](#optional-locateanything-text-annotation)).
+4. **Confirm**: Review auto-annotation results image by image; any edit counts as confirmation.
+5. **Train**: On the training page, choose a base model and parameters (or use presets) → start training → curves update in real time; upon completion the model is auto-registered and loaded.
+6. **Iterate**: Use the new model to continue auto-labeling → confirm → train again, until satisfied.
+
+## ⌨️ Shortcuts
+
+| Context | Shortcut | Action |
+|:---:|:---|:---|
+| General | <kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Ctrl</kbd>+<kbd>Y</kbd> | Undo / Redo (per-image) |
+| General | <kbd>Ctrl</kbd>+<kbd>S</kbd> | Save all changes |
+| General | <kbd>Shift</kbd>+<kbd>A</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd> | Auto-label current image / Batch auto-label |
+| General | <kbd>T</kbd> | Apply loaded tag to selected images |
+| General | <kbd>F5</kbd> | Rescan image directory |
+| Detection / Pose | <kbd>W</kbd> / <kbd>K</kbd> / <kbd>V</kbd> | Draw box / Keypoint / Select tool |
+| Detection / Pose | <kbd>A</kbd>・<kbd>←</kbd> / <kbd>D</kbd>・<kbd>→</kbd> | Previous / Next image (auto-save) |
+| Detection / Pose | <kbd>Space</kbd> / <kbd>Ctrl</kbd>+<kbd>Space</kbd> | Confirm selected annotation / Confirm all |
+| Detection / Pose | <kbd>Delete</kbd> | Delete selected annotation |
+| Detection / Pose | <kbd>Ctrl</kbd>+<kbd>C</kbd> / <kbd>Ctrl</kbd>+<kbd>V</kbd> | Copy / Paste annotation |
+| Detection / Pose | <kbd>Ctrl</kbd>+<kbd>=</kbd> / <kbd>Ctrl</kbd>+<kbd>-</kbd> / <kbd>Ctrl</kbd>+<kbd>0</kbd> | Zoom in / Zoom out / Fit to window |
+| Classification | <kbd>1</kbd>–<kbd>9</kbd> | Select class and go to next image |
+| Classification | <kbd>Delete</kbd> / <kbd>Backspace</kbd> | Clear selected image label |
+
+## 🔄 Import / Export
+
+| Format | Import | Export | Supported Tasks |
+|:---|:---:|:---:|:---|
+| YOLO (txt) | ✅ | ✅ | Detection / Pose |
+| COCO (json) | ✅ | ✅ | Detection / Pose |
+| labelme (json) | ✅ | ✅ | Detection / Pose |
+| ImageFolder (class-based folders) | ✅ | ✅ | Classification |
+| CSV (annotation summary) | — | ✅ | All |
 
 ---
 
 ## Platform Notes
 
-Dataset preparation creates many links "pointing to the original images." The code (`link_or_copy` in `src/utils/fs.py`) falls back automatically in the following priority order so it runs on any platform:
+Training dataset preparation creates numerous links pointing to original images. The code (`src/utils/fs.py`'s `link_or_copy`) degrades automatically in the following priority order to ensure it works on any platform:
 
 ```
-symlink (symbolic link) → hardlink (hard link) → copy
+symlink → hardlink → copy
 ```
 
-| Method | Condition | Speed | Extra space |
+| Method | Conditions | Speed | Extra Storage |
 |:---|:---|:---:|:---:|
-| symlink | Supported and permitted (default on Linux/macOS; Windows needs Developer Mode or admin) | Fastest | Near zero |
-| hardlink | symlink failed, and source and target are on the same volume (no privilege needed on Windows NTFS) | Fastest | Near zero |
-| copy | Both of the above failed (typically: cross-drive + non-Developer-Mode) | Slow | Equal to total image size |
+| symlink | System supports it with permissions (Linux/macOS default; Windows requires Developer Mode or admin) | Fastest | Near zero |
+| hardlink | symlink fails, source and target on the same disk volume (Windows NTFS, no special privileges) | Fastest | Near zero |
+| copy | Both above fail (typical: cross-drive + non-Developer Mode) | Slow | Same as total image size |
 
-> ⚠️ **Windows recommendation**: enable Developer Mode (Settings → Privacy & security → For developers) — a one-time setting that persists and behaves like Linux; or keep the project directory and the image directory on the same drive (the hardlink path kicks in automatically).
+> ⚠️ **Windows recommendations**: Enable Developer Mode (Settings → Privacy & Security → For developers), a one-time setup for permanent parity with Linux; or keep the project directory on the same disk as the images (auto-uses hardlink path).
 >
-> **Other notes**: prefer ASCII-only project paths; if you point the image directory at another drive (cross-drive), links degrade to copies and consume extra disk space.
+> **Other notes**: Use ASCII-only project paths when possible; linking images from a different disk degrades to copying, consuming extra disk space.
+
+---
+## 📁 Project Data Structure
+
+Each annotation project is a regular folder with human-readable JSON annotation data, making it easy to process with scripts:
+
+```
+my_project/
+├── project.json          # Project config: task type, classes, tag registry
+├── images/               # Images (can also point to an external directory)
+├── labels/               # One JSON annotation file per image
+│   └── img_001.json
+├── models/
+│   ├── registry.json     # Metadata of registered models
+│   └── detect-.../weights/best.pt
+├── datasets/current/     # Auto-generated YOLO dataset during training (symlinks, no image copying)
+└── .backups/             # Auto-backup snapshots (keeps last 20)
+```
+
+Coordinate convention: all annotation coordinates are normalized to `[0,1]`, bounding boxes use center-point format `(cx, cy, w, h)`, consistent with the YOLO format.
+
+Global app configuration and logs are located at `~/.autolabel/`.
 
 ---
 
-## Project Structure
-
-```
-autolabel-dock/
-├── src/
-│   ├── core/         Pure data models and IO (annotations, project config, import/export formats, backups)
-│   ├── engine/       YOLO training / inference wrappers and dataset preparation
-│   ├── controllers/  Bridging and orchestration between UI and core layers
-│   ├── ui/           PyQt5 UI components (canvas, panels, dialogs)
-│   └── utils/        Background threads, undo stack, image cache, and other utilities
-├── tests/            pytest tests
-├── resources/        Screenshots and other static resources
-├── main.py           Application entry point
-└── requirements.txt  Dependency list
-```
-
----
-
-## Contributing
-
-Issues and PRs are welcome. After setting up the environment per the Installation section above, run the tests:
-
-```bash
-pytest
-```
-
-## License
+## 📄 License
 
 This project is released under the **[AGPL-3.0](LICENSE)** license.
 
@@ -265,8 +200,4 @@ This project is released under the **[AGPL-3.0](LICENSE)** license.
 > - **PyQt5** — GPL-3.0
 > - **Ultralytics (YOLOv8)** — AGPL-3.0
 >
-> The strictest among the dependencies is AGPL-3.0, and this project aligns accordingly. To use it in a closed-source/commercial product, obtain the corresponding commercial licenses for those dependencies yourself (a PyQt commercial license, an Ultralytics enterprise license).
-
-## Links
-
-- **[Linux DO](https://linux.do/)**
+> The most restrictive among dependencies is AGPL-3.0, to which this project aligns. If you need to use this in closed-source or commercial products, please obtain the appropriate commercial licenses for the respective dependencies (PyQt commercial license, Ultralytics enterprise license).
