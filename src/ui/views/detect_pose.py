@@ -25,7 +25,8 @@ from PyQt5.QtWidgets import (
 )
 
 from src.core.annotation import Annotation, ImageAnnotation
-from src.core.label_io import save_annotation, load_annotation
+from src.core.autolabel import merge_predictions
+from src.core.label_store import LabelStore
 from src.core.project import ProjectManager
 from src.ui.canvas import AnnotationCanvas
 from src.ui.file_list import FileListWidget
@@ -53,6 +54,7 @@ class DetectPoseView(TaskView):
         self,
         image_cache: ImageCache,
         undo_stacks: "OrderedDict[str, UndoStack]",
+        label_store: LabelStore | None = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -61,10 +63,20 @@ class DetectPoseView(TaskView):
         self._current_annotation: ImageAnnotation | None = None
         self._image_cache = image_cache
         self._undo_stacks = undo_stacks
+        # Shared LabelStore (injected by the shell) — reads flush pending
+        # edits first. A private, callback-less store keeps direct view
+        # construction (tests) on plain label IO semantics.
+        self._store = label_store or LabelStore()
         self._last_class: str | None = None
         self._clipboard: list[dict] | None = None
         self._stats_cache: dict = {}
         self._prev_annotations_snapshot: list[tuple] | None = None
+        # Full-record snapshot of the current image as of its last disk
+        # load/save. _save_current skips the disk write when the would-be
+        # record equals this baseline (the flush callback must be cheap and
+        # idempotent when clean — store reads in scan loops trigger it once
+        # per image). None means "unknown → must write".
+        self._last_saved_record: dict | None = None
 
         self._init_ui()
         self._connect_signals()
@@ -197,7 +209,7 @@ class DetectPoseView(TaskView):
         self._file_list.set_image_paths(images)
         for img_path in images:
             label_path = project.label_path_for(img_path)
-            ia = load_annotation(label_path)
+            ia = self._store.load(label_path)
             if ia:
                 self._file_list.set_status(img_path, ia.status)
                 classes_in_img = {a.class_name for a in ia.annotations}
@@ -239,6 +251,19 @@ class DetectPoseView(TaskView):
             if self._current_annotation is not None:
                 self._current_annotation.tags = list(tags)
 
+    def set_image_status(self, path: Path, status: str) -> None:
+        """External writer (batch auto-label) persisted a record for ``path``;
+        mirror the new status into the file list."""
+        self._file_list.set_status(path, status)
+
+    def save_annotation_panel_state(self) -> dict | None:
+        """Snapshot the embedded AnnotationPanel's splitter/collapse state."""
+        return self._ann_panel.save_state()
+
+    def restore_annotation_panel_state(self, state: dict) -> None:
+        """Reapply a shell-cached AnnotationPanel state snapshot."""
+        self._ann_panel.restore_state(state)
+
     def get_focused_image(self) -> Path | None:
         return self._current_image_path
 
@@ -251,24 +276,26 @@ class DetectPoseView(TaskView):
     def reload_current(self) -> None:
         """Discard in-memory state and reload current image's annotations from disk.
 
-        Used after external writers (e.g. batch worker) modify the on-disk JSON
-        for the focused image. We must NOT call _save_current() first, because
-        the canvas/in-memory state is stale relative to those external writes.
+        Used after external writers (e.g. batch worker) supersede the on-disk
+        record for the focused image. The store read below still triggers the
+        flush callback, but _save_current's clean-skip (memory unchanged since
+        its last baseline) keeps the stale in-memory state from overwriting
+        the newer record — memory is then replaced by the reload.
         """
         if not self._project or not self._current_image_path:
             return
         label_path = self._project.label_path_for(self._current_image_path)
-        ia = load_annotation(label_path)
-        if ia is None:
-            w, h = get_image_size(self._current_image_path)
-            ia = ImageAnnotation(
-                image_path=self._current_image_path.name, image_size=(w, h),
-            )
+        ia = self._store.load_or_empty(
+            label_path,
+            self._current_image_path.name,
+            image_size=get_image_size(self._current_image_path),
+        )
         self._current_annotation = ia
         self._canvas.set_annotations(list(ia.annotations))
         self._ann_panel.set_annotations(list(ia.annotations))
         self._emit_status()
         self._prev_annotations_snapshot = self._stats_snapshot(ia.annotations)
+        self._last_saved_record = self._record_snapshot(ia)
 
     def commit_pending_save(self) -> None:
         self._save_current()
@@ -277,13 +304,16 @@ class DetectPoseView(TaskView):
         raise NotImplementedError("DetectPoseView does not support classify predictions")
 
     def add_auto_annotations(self, anns: list[Annotation], iou: float = 0.5) -> None:
-        from src.core.annotation import find_conflicts
-        existing = self._canvas.annotations
-        conflicts, clean = find_conflicts(existing, anns, iou)
-        self._canvas.add_annotations(clean)
-        if conflicts:
-            self._canvas.add_annotations([p for _, p in conflicts])
-            self._canvas.set_conflict_pairs([(e.id, p.id) for e, p in conflicts])
+        # Single merge implementation point (core.autolabel wraps
+        # find_conflicts): the interactive surface adds the conflicting
+        # predictions too and highlights the pairs red for the user.
+        outcome = merge_predictions(self._canvas.annotations, anns, iou)
+        self._canvas.add_annotations(outcome.accepted)
+        if outcome.conflict_pairs:
+            self._canvas.add_annotations(outcome.conflict_predictions)
+            self._canvas.set_conflict_pairs(
+                [(e.id, p.id) for e, p in outcome.conflict_pairs]
+            )
         self._push_undo()
         self._sync_annotations_to_panel()
         if self._current_image_path is not None:
@@ -302,6 +332,11 @@ class DetectPoseView(TaskView):
     def _on_image_selected(self, path: Path) -> None:
         self._save_current()
         self._current_image_path = path
+        # Switch window: _current_image_path now names the NEW image while the
+        # canvas still shows the OLD one. The store read below re-triggers the
+        # flush callback (_save_current); clearing the record makes that flush
+        # a provable no-op instead of relying on the clean-skip alone.
+        self._current_annotation = None
 
         pixmap = self._image_cache.get(path)
         if pixmap:
@@ -314,15 +349,9 @@ class DetectPoseView(TaskView):
 
         if self._project:
             label_path = self._project.label_path_for(path)
-            ia = load_annotation(label_path)
-            if ia:
-                self._current_annotation = ia
-            else:
-                w, h = get_image_size(path)
-                self._current_annotation = ImageAnnotation(
-                    image_path=path.name,
-                    image_size=(w, h),
-                )
+            self._current_annotation = self._store.load_or_empty(
+                label_path, path.name, image_size=get_image_size(path),
+            )
 
             self._canvas.set_annotations(list(self._current_annotation.annotations))
             self._ann_panel.set_annotations(list(self._current_annotation.annotations))
@@ -340,6 +369,7 @@ class DetectPoseView(TaskView):
                 self._undo_stacks.popitem(last=False)
 
             self._prev_annotations_snapshot = self._stats_snapshot(self._current_annotation.annotations)
+            self._last_saved_record = self._record_snapshot(self._current_annotation)
 
         self.image_focus_changed.emit(path)
 
@@ -359,12 +389,32 @@ class DetectPoseView(TaskView):
         if neighbors:
             self._image_cache.preload(neighbors)
 
+    @staticmethod
+    def _record_snapshot(ia: ImageAnnotation) -> dict:
+        """Full-record dict used as the clean-check baseline.
+
+        ``ImageAnnotation.to_dict`` aliases the live ``image_tags`` / ``tags``
+        lists; detach them so a later in-place mutation of the record can't
+        silently equalize the baseline (which would skip a needed write).
+        """
+        d = ia.to_dict()
+        d["image_tags"] = list(d["image_tags"])
+        d["tags"] = list(d["tags"])
+        return d
+
     def _save_current(self) -> None:
         if not self._project or not self._current_image_path or not self._current_annotation:
             return
         self._current_annotation.annotations = list(self._canvas.annotations)
+        record = self._record_snapshot(self._current_annotation)
+        if record == self._last_saved_record:
+            # Clean: nothing changed since the last disk load/save. Skip the
+            # write — this method doubles as the store's flush callback, so
+            # scan loops (one store.load per image) hit it N times.
+            return
         label_path = self._project.label_path_for(self._current_image_path)
-        save_annotation(self._current_annotation, label_path)
+        self._store.save(self._current_annotation, label_path)
+        self._last_saved_record = record
         logger.debug("Saved annotations for %s", self._current_image_path.name)
         self._file_list.set_status(self._current_image_path, self._current_annotation.status)
         old_snap = self._prev_annotations_snapshot or []
@@ -498,8 +548,11 @@ class DetectPoseView(TaskView):
     def _on_keypoint_attach_requested(self, ann_id: str, px: float, py: float) -> None:
         from src.core.annotation import Keypoint
 
+        # Consume the draw-origin at entry: later canvas events (while the
+        # picker below is open) can no longer rewrite it under us.
+        start = self._canvas.consume_draw_start()
         ann = next((a for a in self._canvas.annotations if a.id == ann_id), None)
-        if ann is None or not self._canvas._draw_start:
+        if ann is None or not start:
             self._clear_draw_state()
             return
 
@@ -530,10 +583,9 @@ class DetectPoseView(TaskView):
             self._clear_draw_state()
             return
 
-        nx, ny = self._canvas._draw_start
+        nx, ny = start
         kp = Keypoint(x=nx, y=ny, visible=2, label=label)
         self._canvas.add_keypoint_to_annotation(ann_id, kp)
-        self._canvas._draw_start = None
         self._push_undo()
         self._sync_annotations_to_panel()
 
@@ -591,7 +643,7 @@ class DetectPoseView(TaskView):
         stats["total_images"] = len(images)
         for img_path in images:
             label_path = self._project.label_path_for(img_path)
-            ia = load_annotation(label_path)
+            ia = self._store.load(label_path)
             if ia is None or len(ia.annotations) == 0:
                 continue
             stats["labeled_images"] += 1
@@ -778,12 +830,12 @@ class DetectPoseView(TaskView):
         count = 0
         for img_path in paths:
             label_path = self._project.label_path_for(img_path)
-            ia = load_annotation(label_path)
+            ia = self._store.load(label_path)
             if ia and ia.annotations:
                 old_snap = self._stats_snapshot(ia.annotations)
                 for ann in ia.annotations:
                     ann.confirmed = True
-                save_annotation(ia, label_path)
+                self._store.save(ia, label_path)
                 self._file_list.set_status(img_path, ia.status)
                 self._update_stats_incremental(old_snap, self._stats_snapshot(ia.annotations))
                 count += 1
@@ -799,11 +851,11 @@ class DetectPoseView(TaskView):
         count = 0
         for img_path in paths:
             label_path = self._project.label_path_for(img_path)
-            ia = load_annotation(label_path)
+            ia = self._store.load(label_path)
             if ia and ia.annotations:
                 old_snap = self._stats_snapshot(ia.annotations)
                 ia.annotations.clear()
-                save_annotation(ia, label_path)
+                self._store.save(ia, label_path)
                 self._file_list.set_status(img_path, "unlabeled")
                 self._update_stats_incremental(old_snap, [])
                 count += 1
@@ -818,11 +870,11 @@ class DetectPoseView(TaskView):
             return
         paths = list(paths)
 
-        # Flush in-memory edits first so the labeled-count below is accurate.
-        self._save_current()
+        # Labeled-count scan: the store flushes pending edits on first read,
+        # so the count below reflects the in-memory canvas too.
         labeled_count = 0
         for p in paths:
-            ia = load_annotation(self._project.label_path_for(p))
+            ia = self._store.load(self._project.label_path_for(p))
             if ia and ia.annotations:
                 labeled_count += 1
 
@@ -858,6 +910,7 @@ class DetectPoseView(TaskView):
             self._current_image_path = None
             self._current_annotation = None
             self._prev_annotations_snapshot = None
+            self._last_saved_record = None
             self._canvas.clear()
             self._ann_panel.set_annotations([])
 
@@ -878,7 +931,7 @@ class DetectPoseView(TaskView):
         total = 0
         for img_path in visible_paths:
             label_path = self._project.label_path_for(img_path)
-            ia = load_annotation(label_path)
+            ia = self._store.load(label_path)
             if ia:
                 unconfirmed = sum(1 for a in ia.annotations if not a.confirmed)
                 if unconfirmed > 0:
@@ -893,10 +946,9 @@ class DetectPoseView(TaskView):
         if not visible_paths:
             return
 
-        # Flush the focused image's in-memory annotations to disk BEFORE
-        # scanning label JSONs, so its pending annotations are counted and
-        # confirmed too (and the stale disk copy can't overwrite unsaved edits).
-        self._save_current()
+        # No explicit pre-scan flush: _collect_unconfirmed reads through the
+        # store, which flushes the focused image's pending annotations first
+        # (so they are counted/confirmed and stale disk can't win).
         affected, total = self._collect_unconfirmed(visible_paths)
         if total == 0:
             self.status_changed.emit("没有需要确认的预标注")
@@ -916,7 +968,7 @@ class DetectPoseView(TaskView):
             for ann in ia.annotations:
                 if not ann.confirmed:
                     ann.confirmed = True
-            save_annotation(ia, label_path)
+            self._store.save(ia, label_path)
             self._file_list.set_status(img_path, ia.status)
             self._update_stats_incremental(old_snap, self._stats_snapshot(ia.annotations))
             count += 1
@@ -933,8 +985,7 @@ class DetectPoseView(TaskView):
         if not visible_paths:
             return
 
-        # Same ordering constraint as _batch_confirm_visible: flush before scan.
-        self._save_current()
+        # Same as _batch_confirm_visible: the store-mediated scan flushes.
         affected, total = self._collect_unconfirmed(visible_paths)
         if total == 0:
             self.status_changed.emit("没有需要撤销的预标注")
@@ -952,7 +1003,7 @@ class DetectPoseView(TaskView):
         for img_path, label_path, ia in affected:
             old_snap = self._stats_snapshot(ia.annotations)
             ia.annotations = [a for a in ia.annotations if a.confirmed]
-            save_annotation(ia, label_path)
+            self._store.save(ia, label_path)
             self._file_list.set_status(img_path, ia.status)
             self._update_stats_incremental(old_snap, self._stats_snapshot(ia.annotations))
             count += 1
@@ -970,7 +1021,7 @@ class DetectPoseView(TaskView):
         result = []
         for img_path in self._project.list_images():
             label_path = self._project.label_path_for(img_path)
-            ia = load_annotation(label_path)
+            ia = self._store.load(label_path)
             if ia is None or len(ia.annotations) == 0:
                 result.append(img_path)
         return result

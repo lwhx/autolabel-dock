@@ -219,6 +219,17 @@ class AnnotationCanvas(QWidget):
         self._draw_current = None
         self.update()
 
+    def consume_draw_start(self) -> tuple[float, float] | None:
+        """Return and clear the pending draw-origin (normalized), or None.
+
+        Single-shot read used by the keypoint-attach flow: snapshotting at
+        entry means later canvas events (e.g. while a picker popup is open)
+        cannot rewrite the origin under the caller.
+        """
+        start = self._draw_start
+        self._draw_start = None
+        return start
+
     def clear(self) -> None:
         """Clear image and annotations."""
         self._image = None

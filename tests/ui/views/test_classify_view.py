@@ -406,14 +406,14 @@ def test_classify_redo_reapplies_tag(qapp, tmp_path):
         qapp.processEvents()
 
 
-def test_preview_pane_closes_and_saves(qapp, tmp_path, monkeypatch):
-    import pathlib
+def test_preview_pane_closes_and_saves(qapp, tmp_path):
     from src.core.config import AppConfig
     from src.ui.label_panel import LabelPanel
-    monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path))
 
+    cfg = AppConfig()
+    cfg_path = tmp_path / "cfg.json"
     pm = _make_classify_project(tmp_path / "p", n_imgs=2)
-    panel = LabelPanel(config_path=tmp_path / "cfg.json")
+    panel = LabelPanel(config_path=cfg_path, app_config=cfg)
     try:
         panel.set_project(pm)
         assert panel._view._preview.isHidden() is False
@@ -421,8 +421,9 @@ def test_preview_pane_closes_and_saves(qapp, tmp_path, monkeypatch):
         panel._view._on_preview_close()
 
         assert panel._view._preview.isHidden() is True
-        cfg = AppConfig.load(tmp_path / ".autolabel" / "config.json")
-        assert cfg.classify_preview_visible is False
+        assert cfg.classify.preview_visible is False
+        loaded = AppConfig.load(cfg_path)
+        assert loaded.classify.preview_visible is False
     finally:
         panel._view.cleanup()
         panel.deleteLater()
@@ -432,20 +433,16 @@ def test_preview_pane_closes_and_saves(qapp, tmp_path, monkeypatch):
         qapp.processEvents()
 
 
-def test_preview_pane_show_persists_visible(qapp, tmp_path, monkeypatch):
-    import pathlib
+def test_preview_pane_show_persists_visible(qapp, tmp_path):
     from src.core.config import AppConfig
     from src.ui.label_panel import LabelPanel
-    monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path))
 
-    cfg_path = tmp_path / ".autolabel" / "config.json"
-    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path = tmp_path / "cfg.json"
     cfg = AppConfig()
-    cfg.classify_preview_visible = False
-    cfg.save(cfg_path)
+    cfg.classify.preview_visible = False
 
     pm = _make_classify_project(tmp_path / "p", n_imgs=2)
-    panel = LabelPanel(config_path=tmp_path / "cfg.json")
+    panel = LabelPanel(config_path=cfg_path, app_config=cfg)
     try:
         panel.set_project(pm)
         assert panel._view._preview.isHidden() is True
@@ -454,7 +451,7 @@ def test_preview_pane_show_persists_visible(qapp, tmp_path, monkeypatch):
 
         assert panel._view._preview.isHidden() is False
         cfg2 = AppConfig.load(cfg_path)
-        assert cfg2.classify_preview_visible is True
+        assert cfg2.classify.preview_visible is True
     finally:
         panel._view.cleanup()
         panel.deleteLater()
@@ -474,8 +471,10 @@ def test_preview_toggle_button_reopens_preview(qapp, tmp_path, monkeypatch):
     from src.ui.label_panel import LabelPanel
     monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path))
 
+    cfg = AppConfig()
+    cfg_path = tmp_path / "cfg.json"
     pm = _make_classify_project(tmp_path / "p", n_imgs=2)
-    panel = LabelPanel(config_path=tmp_path / "cfg.json")
+    panel = LabelPanel(config_path=cfg_path, app_config=cfg)
     try:
         panel.set_project(pm)
         view = panel._view
@@ -493,8 +492,8 @@ def test_preview_toggle_button_reopens_preview(qapp, tmp_path, monkeypatch):
         view._preview_toggle_btn.click()
         assert view._preview.isHidden() is False
         assert view._preview_toggle_btn.isChecked() is True
-        cfg = AppConfig.load(tmp_path / ".autolabel" / "config.json")
-        assert cfg.classify_preview_visible is True
+        loaded = AppConfig.load(cfg_path)
+        assert loaded.classify.preview_visible is True
 
         # Click again to hide via toggle — verifies symmetric behavior.
         view._preview_toggle_btn.click()
@@ -509,21 +508,16 @@ def test_preview_toggle_button_reopens_preview(qapp, tmp_path, monkeypatch):
         qapp.processEvents()
 
 
-def test_preview_toggle_button_syncs_with_persisted_hidden_state(qapp, tmp_path, monkeypatch):
+def test_preview_toggle_button_syncs_with_persisted_hidden_state(qapp, tmp_path):
     """When project loads with preview hidden in config, toggle starts unchecked."""
-    import pathlib
     from src.core.config import AppConfig
     from src.ui.label_panel import LabelPanel
-    monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path))
 
-    cfg_path = tmp_path / ".autolabel" / "config.json"
-    cfg_path.parent.mkdir(parents=True, exist_ok=True)
     cfg = AppConfig()
-    cfg.classify_preview_visible = False
-    cfg.save(cfg_path)
+    cfg.classify.preview_visible = False
 
     pm = _make_classify_project(tmp_path / "p", n_imgs=2)
-    panel = LabelPanel(config_path=tmp_path / "cfg.json")
+    panel = LabelPanel(config_path=tmp_path / "cfg.json", app_config=cfg)
     try:
         panel.set_project(pm)
         view = panel._view
@@ -637,20 +631,21 @@ def test_class_bar_rebuilds_after_set_classes(qapp, tmp_path):
         qapp.processEvents()
 
 
-def test_density_slider_updates_icon_size(qapp, tmp_path, monkeypatch):
-    import pathlib
+def test_density_slider_updates_icon_size(qapp, tmp_path):
     from src.core.config import AppConfig
     from src.ui.label_panel import LabelPanel
-    monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path))
 
+    cfg = AppConfig()
+    cfg_path = tmp_path / "cfg.json"
     pm = _make_classify_project(tmp_path / "p", n_imgs=1)
-    panel = LabelPanel(config_path=tmp_path / "cfg.json")
+    panel = LabelPanel(config_path=cfg_path, app_config=cfg)
     try:
         panel.set_project(pm)
         panel._view._density_slider.setValue(128)
         assert panel._view._grid.iconSize().width() == 128
-        cfg = AppConfig.load(tmp_path / ".autolabel" / "config.json")
-        assert cfg.classify_grid_density == 128
+        assert cfg.classify.grid_density == 128
+        loaded = AppConfig.load(cfg_path)
+        assert loaded.classify.grid_density == 128
     finally:
         panel._view.cleanup()
         panel.deleteLater()
@@ -660,20 +655,15 @@ def test_density_slider_updates_icon_size(qapp, tmp_path, monkeypatch):
         qapp.processEvents()
 
 
-def test_density_persisted_value_applied_on_set_project(qapp, tmp_path, monkeypatch):
-    import pathlib
+def test_density_persisted_value_applied_on_set_project(qapp, tmp_path):
     from src.core.config import AppConfig
     from src.ui.label_panel import LabelPanel
-    monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path))
 
-    cfg_path = tmp_path / ".autolabel" / "config.json"
-    cfg_path.parent.mkdir(parents=True, exist_ok=True)
     cfg = AppConfig()
-    cfg.classify_grid_density = 144
-    cfg.save(cfg_path)
+    cfg.classify.grid_density = 144
 
     pm = _make_classify_project(tmp_path / "p", n_imgs=1)
-    panel = LabelPanel(config_path=tmp_path / "cfg.json")
+    panel = LabelPanel(config_path=tmp_path / "cfg.json", app_config=cfg)
     try:
         panel.set_project(pm)
         assert panel._view._density_slider.value() == 144
@@ -687,13 +677,14 @@ def test_density_persisted_value_applied_on_set_project(qapp, tmp_path, monkeypa
         qapp.processEvents()
 
 
-def test_classify_sort_by_class_groups(qapp, tmp_path, monkeypatch):
-    import pathlib
+def test_classify_sort_by_class_groups(qapp, tmp_path):
     from src.core.annotation import ImageAnnotation
     from src.core.config import AppConfig
     from src.core.label_io import save_annotation
     from src.ui.label_panel import LabelPanel
-    monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path))
+
+    cfg = AppConfig()
+    cfg_path = tmp_path / "cfg.json"
 
     pm = _make_classify_project(tmp_path / "p", n_imgs=4, classes=["cat", "dog"])
     imgs = pm.list_images()
@@ -710,7 +701,7 @@ def test_classify_sort_by_class_groups(qapp, tmp_path, monkeypatch):
         pm.label_path_for(imgs[1]),
     )
 
-    panel = LabelPanel(config_path=tmp_path / "cfg.json")
+    panel = LabelPanel(config_path=cfg_path, app_config=cfg)
     try:
         panel.set_project(pm)
         panel._view._sort_combo.setCurrentIndex(1)  # 按类别
@@ -722,8 +713,9 @@ def test_classify_sort_by_class_groups(qapp, tmp_path, monkeypatch):
         dog_pos = order.index(imgs[1].name)
         assert max(cat_pos) < dog_pos
 
-        cfg = AppConfig.load(tmp_path / ".autolabel" / "config.json")
-        assert cfg.classify_grid_sort == "class"
+        assert cfg.classify.grid_sort == "class"
+        loaded = AppConfig.load(cfg_path)
+        assert loaded.classify.grid_sort == "class"
     finally:
         panel._view.cleanup()
         panel.deleteLater()
@@ -733,19 +725,14 @@ def test_classify_sort_by_class_groups(qapp, tmp_path, monkeypatch):
         qapp.processEvents()
 
 
-def test_classify_sort_persisted_class_applied_on_set_project(qapp, tmp_path, monkeypatch):
-    import pathlib
+def test_classify_sort_persisted_class_applied_on_set_project(qapp, tmp_path):
     from src.core.annotation import ImageAnnotation
     from src.core.config import AppConfig
     from src.core.label_io import save_annotation
     from src.ui.label_panel import LabelPanel
-    monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path))
 
-    cfg_path = tmp_path / ".autolabel" / "config.json"
-    cfg_path.parent.mkdir(parents=True, exist_ok=True)
     cfg = AppConfig()
-    cfg.classify_grid_sort = "class"
-    cfg.save(cfg_path)
+    cfg.classify.grid_sort = "class"
 
     pm = _make_classify_project(tmp_path / "p", n_imgs=2, classes=["cat"])
     imgs = pm.list_images()
@@ -754,7 +741,7 @@ def test_classify_sort_persisted_class_applied_on_set_project(qapp, tmp_path, mo
         pm.label_path_for(imgs[1]),
     )
 
-    panel = LabelPanel(config_path=tmp_path / "cfg.json")
+    panel = LabelPanel(config_path=tmp_path / "cfg.json", app_config=cfg)
     try:
         panel.set_project(pm)
         grid = panel._view._grid

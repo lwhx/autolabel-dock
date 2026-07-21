@@ -12,9 +12,11 @@ from PyQt5.QtWidgets import QWidget, QFileDialog, QMessageBox, QListWidgetItem
 
 from src.core.config import AppConfig
 from src.core.project import ProjectManager
-from src.core.label_io import load_annotation, save_annotation
+from src.core.label_store import LabelStore
 from src.core.backup import BackupManager
+from src.core.formats.import_merge import merge_imported_records
 from src.ui.dialogs import NewProjectDialog, ExportDialog, ClassManagerDialog, ImportDialog
+from src.utils.image import get_image_size
 
 logger = logging.getLogger(__name__)
 
@@ -48,12 +50,21 @@ class ClassPreviewItem:
 class ProjectController:
     """Handles project lifecycle: create, open, export, class management."""
 
-    def __init__(self, app_config: AppConfig, config_path: Path, parent_widget: QWidget):
+    def __init__(
+        self,
+        app_config: AppConfig,
+        config_path: Path,
+        parent_widget: QWidget,
+        label_store: LabelStore | None = None,
+    ):
         self._app_config = app_config
         self._config_path = config_path
         self._parent = parent_widget
         self._project: ProjectManager | None = None
         self._backup_mgr: BackupManager | None = None
+        # Shared LabelStore (MainWindow-owned): export collection and import
+        # merge read through it so pending edits are flushed first.
+        self._store = label_store or LabelStore()
 
     @property
     def project(self) -> ProjectManager | None:
@@ -133,7 +144,7 @@ class ProjectController:
             annotations = []
             for img_path in project.list_images():
                 label_path = project.label_path_for(img_path)
-                ia = load_annotation(label_path)
+                ia = self._store.load(label_path)
                 if ia:
                     annotations.append(ia)
 
@@ -152,8 +163,12 @@ class ProjectController:
             raise
 
     def import_annotations(self, project: ProjectManager) -> int | None:
-        """Show import dialog and import annotations.
+        """Show import dialog and import annotations (dialog + backup +
+        dispatch + message shell).
 
+        Record importers dispatch via ``ImportRegistry.import_records`` and
+        merge via the Qt-free ``merge_imported_records`` pipeline; full
+        importers (``is_full_import``) manage images+labels themselves.
         Returns number of images imported, or None if cancelled/failed.
         New class names found in imported data are auto-added to project classes.
         """
@@ -169,7 +184,8 @@ class ProjectController:
             self.create_backup()
 
             from src.core.formats import get_import_registry
-            info = get_import_registry().get(fmt)
+            registry = get_import_registry()
+            info = registry.get(fmt)
             if info is None:
                 QMessageBox.warning(self._parent, "导入失败", f"未知的导入格式: {fmt}")
                 return None
@@ -190,137 +206,30 @@ class ProjectController:
                             fmt, path, imported_count, skipped_count)
                 return imported_count
 
-            imported = self._invoke_importer(fmt, path, project.config.classes)
-            if not imported:
+            records = registry.import_records(fmt, path, project.config.classes)
+            if not records:
                 QMessageBox.information(self._parent, "提示", "未找到可导入的标注")
                 return 0
 
-            # Build lookup of existing project images by stem
-            image_by_stem: dict[str, Path] = {
-                p.stem: p for p in project.list_images()
-            }
+            result = merge_imported_records(
+                project, self._store, records, conflict_mode,
+                read_image_size=get_image_size,
+            )
 
-            # Collect new classes (preserve order, dedupe)
-            existing_classes = set(project.config.classes)
-            new_classes: list[str] = []
-            for ia in imported:
-                for ann in ia.annotations:
-                    if ann.class_name and ann.class_name not in existing_classes:
-                        existing_classes.add(ann.class_name)
-                        new_classes.append(ann.class_name)
-                for tag in ia.image_tags:
-                    if tag and tag not in existing_classes:
-                        existing_classes.add(tag)
-                        new_classes.append(tag)
-            if new_classes:
-                project.config.classes.extend(new_classes)
-                project.save()
-
-            # Re-resolve class_id against (possibly updated) project classes
-            imported_count = 0
-            skipped_count = 0
-            for ia in imported:
-                stem = Path(ia.image_path).stem
-                matched = image_by_stem.get(stem)
-                if matched is None:
-                    skipped_count += 1
-                    continue
-
-                label_path = project.label_path_for(matched)
-                existing = load_annotation(label_path)
-
-                # Re-map class_id to current project classes
-                for ann in ia.annotations:
-                    cid = project.config.get_class_id(ann.class_name)
-                    if cid >= 0:
-                        ann.class_id = cid
-
-                # Determine image_size (prefer existing, else imported, else load from disk)
-                img_size = (0, 0)
-                if existing and existing.image_size != (0, 0):
-                    img_size = existing.image_size
-                elif ia.image_size != (0, 0):
-                    img_size = ia.image_size
-                else:
-                    from src.utils.image import get_image_size
-                    try:
-                        img_size = get_image_size(matched)
-                    except (OSError, ValueError):
-                        img_size = (0, 0)
-
-                # Apply conflict resolution
-                if conflict_mode == "skip" and existing and existing.annotations:
-                    skipped_count += 1
-                    continue
-                elif conflict_mode == "overwrite" or existing is None:
-                    new_ia = ia
-                    new_ia.image_path = matched.name
-                    new_ia.image_size = img_size
-                elif conflict_mode == "merge":
-                    existing.annotations.extend(ia.annotations)
-                    if existing.image_size == (0, 0):
-                        existing.image_size = img_size
-                    if ia.image_tags and not existing.image_tags:
-                        existing.image_tags = list(ia.image_tags)
-                        existing.image_tags_confirmed = ia.image_tags_confirmed
-                        existing.image_tags_source = ia.image_tags_source
-                    new_ia = existing
-                else:
-                    # Fallback: treat as overwrite when no existing
-                    new_ia = ia
-                    new_ia.image_path = matched.name
-                    new_ia.image_size = img_size
-
-                save_annotation(new_ia, label_path)
-                imported_count += 1
-
-            msg = f"成功导入 {imported_count} 个图片的标注"
-            if skipped_count:
-                msg += f"，跳过 {skipped_count} 个"
-            if new_classes:
-                msg += f"\n自动添加了 {len(new_classes)} 个新类别: {', '.join(new_classes)}"
+            msg = f"成功导入 {result.imported} 个图片的标注"
+            if result.skipped:
+                msg += f"，跳过 {result.skipped} 个"
+            if result.new_classes:
+                msg += f"\n自动添加了 {len(result.new_classes)} 个新类别: {', '.join(result.new_classes)}"
             QMessageBox.information(self._parent, "导入完成", msg)
-            logger.info("Imported %s from %s: %d ok, %d skipped", fmt, path, imported_count, skipped_count)
-            return imported_count
+            logger.info("Imported %s from %s: %d ok, %d skipped",
+                        fmt, path, result.imported, result.skipped)
+            return result.imported
 
         except (OSError, ValueError, KeyError, json.JSONDecodeError) as e:
             logger.error("Import failed: %s", e, exc_info=True)
             QMessageBox.warning(self._parent, "导入失败", str(e))
             return None
-
-    def _invoke_importer(self, fmt: str, path: str, classes: list[str]) -> list:
-        """Invoke the appropriate importer. Each importer has a different signature."""
-        from src.core.formats import get_import_registry
-        from src.core.formats.yolo import import_yolo_auto
-        from src.core.formats.coco import import_coco
-        from src.core.formats.labelme import import_labelme
-
-        registry = get_import_registry()
-        info = registry.get(fmt)
-        if info is None:
-            raise ValueError(f"未知的导入格式: {fmt}")
-
-        p = Path(path)
-        if fmt == "YOLO":
-            has_external_metadata = any(
-                candidate.exists()
-                for candidate in [
-                    p / "data.yaml",
-                    p.parent / "data.yaml",
-                    p / "classes.txt",
-                    p.parent / "classes.txt",
-                ]
-            )
-            return import_yolo_auto(
-                p,
-                classes=None if has_external_metadata else (classes or None),
-            )
-        elif fmt == "COCO":
-            return import_coco(p, classes=classes or None)
-        elif fmt == "labelme":
-            return import_labelme(p)
-        else:
-            raise ValueError(f"未实现的导入格式: {fmt}")
 
     def manage_classes(self, project: ProjectManager) -> bool:
         """Show class manager dialog. Returns True if classes were changed."""
@@ -398,28 +307,24 @@ class ProjectController:
         return True, name, None
 
     def preview_model_classes(self, predictor) -> list[ClassPreviewItem]:
-        """Diff predictor.model.names against project.classes.
+        """Diff the predictor's class names against project.classes.
 
         Returns one ClassPreviewItem per model class that is *not* in
         ``project.classes``. Already-registered classes are excluded — the
-        dialog should only ask the user about new ones.
+        dialog should only ask the user about new ones. The dict/list
+        heterogeneity of ultralytics ``model.names`` is resolved inside
+        ``PredictorProtocol.class_names()``; open-vocabulary backends report no
+        fixed vocabulary (empty list) and yield no preview items.
         """
         if predictor is None or self._project is None:
             return []
-        model = getattr(predictor, "model", None)
-        names = getattr(model, "names", None) if model is not None else None
+        names = predictor.class_names()
         if not names:
-            return []
-        if isinstance(names, dict):
-            iterable = names.values()
-        elif isinstance(names, (list, tuple)):
-            iterable = names
-        else:
             return []
         existing = set(self._project.config.classes)
         items: list[ClassPreviewItem] = []
         seen: set[str] = set()
-        for raw in iterable:
+        for raw in names:
             ok, name, reason = self._validate_class_name(raw)
             if not ok and reason == "rejected_invalid":
                 continue

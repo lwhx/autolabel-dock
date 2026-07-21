@@ -8,7 +8,6 @@ from PyQt5.QtWidgets import QWidget, QFileDialog, QInputDialog, QMessageBox
 
 from src.core.project import ProjectManager
 from src.core.annotation import ImageAnnotation
-from src.core.label_io import load_annotation, save_annotation
 from src.core.model_structure import LayerInfo, ModelStructureError, parse_model_structure
 from src.engine.backends import get_backend
 from src.engine.backends.base import BackendError, PredictorProtocol

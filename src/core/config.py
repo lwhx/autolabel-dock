@@ -1,4 +1,11 @@
-"""Global application configuration (~/.autolabel/config.json)."""
+"""Global application configuration (~/.autolabel/config.json).
+
+Single in-memory authority: MainWindow loads AppConfig once at startup and
+every writer (ProjectController, closeEvent, ClassifyView via its injected
+slice + saver) mutates that shared instance before saving — no other code
+should call ``AppConfig.load`` mid-session (a disk round-trip would create a
+second authority and last-writer-wins data loss).
+"""
 from __future__ import annotations
 
 import json
@@ -7,23 +14,31 @@ from pathlib import Path
 
 
 @dataclass
+class ClassifyViewState:
+    """Persisted UI state for the classify view (a slice of AppConfig).
+
+    The view holds the SAME mutable instance as ``AppConfig.classify`` —
+    mutating a field updates the in-memory authority; persisting is the
+    owner-injected saver's job. Serialized flat (``classify_grid_density``
+    etc.) for zero disk-format change.
+    """
+
+    grid_density: int = 96
+    grid_sort: str = "filename"  # "filename" | "class"
+    preview_width: int = 320
+    preview_visible: bool = True
+
+
+@dataclass
 class AppConfig:
     """Global app settings persisted across sessions."""
 
     recent_projects: list[str] = field(default_factory=list)
-    theme: str = "dark"
-    auto_save: bool = True
-    default_conf_threshold: float = 0.5
-    default_iou_threshold: float = 0.45
-    overlap_iou_threshold: float = 0.5
     script_tools: dict[str, str] = field(default_factory=dict)
     window_geometry: dict[str, int] = field(
         default_factory=lambda: {"x": 100, "y": 100, "width": 1400, "height": 900}
     )
-    classify_grid_density: int = 96
-    classify_grid_sort: str = "filename"  # "filename" | "class"
-    classify_preview_width: int = 320
-    classify_preview_visible: bool = True
+    classify: ClassifyViewState = field(default_factory=ClassifyViewState)
     annotation_panel_splitter_sizes: list[int] = field(default_factory=list)
     annotation_panel_collapsed: dict[str, bool] = field(default_factory=dict)
     # Experimental: master switch to fully hide the optional LocateAnything
@@ -34,17 +49,14 @@ class AppConfig:
     def to_dict(self) -> dict:
         return {
             "recent_projects": self.recent_projects,
-            "theme": self.theme,
-            "auto_save": self.auto_save,
-            "default_conf_threshold": self.default_conf_threshold,
-            "default_iou_threshold": self.default_iou_threshold,
-            "overlap_iou_threshold": self.overlap_iou_threshold,
             "script_tools": self.script_tools,
             "window_geometry": self.window_geometry,
-            "classify_grid_density": self.classify_grid_density,
-            "classify_grid_sort": self.classify_grid_sort,
-            "classify_preview_width": self.classify_preview_width,
-            "classify_preview_visible": self.classify_preview_visible,
+            # Classify slice is flattened back to the legacy flat keys so the
+            # on-disk format is unchanged for live fields.
+            "classify_grid_density": self.classify.grid_density,
+            "classify_grid_sort": self.classify.grid_sort,
+            "classify_preview_width": self.classify.preview_width,
+            "classify_preview_visible": self.classify.preview_visible,
             "annotation_panel_splitter_sizes": self.annotation_panel_splitter_sizes,
             "annotation_panel_collapsed": self.annotation_panel_collapsed,
             "enable_locateanything": self.enable_locateanything,
@@ -72,19 +84,38 @@ class AppConfig:
                 if isinstance(v, bool)
             }
 
+        # Classify slice — picked from the legacy flat keys, with per-field
+        # type sanitization (invalid types fall back to defaults).
+        defaults = ClassifyViewState()
+        raw_density = d.get("classify_grid_density", defaults.grid_density)
+        grid_density = (
+            raw_density
+            if isinstance(raw_density, int) and not isinstance(raw_density, bool)
+            else defaults.grid_density
+        )
+        raw_sort = d.get("classify_grid_sort", defaults.grid_sort)
+        grid_sort = raw_sort if isinstance(raw_sort, str) else defaults.grid_sort
+        raw_width = d.get("classify_preview_width", defaults.preview_width)
+        preview_width = (
+            raw_width
+            if isinstance(raw_width, int) and not isinstance(raw_width, bool)
+            else defaults.preview_width
+        )
+        raw_visible = d.get("classify_preview_visible", defaults.preview_visible)
+        preview_visible = (
+            raw_visible if isinstance(raw_visible, bool) else defaults.preview_visible
+        )
+
         return cls(
             recent_projects=d.get("recent_projects", []),
-            theme=d.get("theme", "dark"),
-            auto_save=d.get("auto_save", True),
-            default_conf_threshold=d.get("default_conf_threshold", 0.5),
-            default_iou_threshold=d.get("default_iou_threshold", 0.45),
-            overlap_iou_threshold=d.get("overlap_iou_threshold", 0.5),
             script_tools=script_tools,
             window_geometry=d.get("window_geometry", {"x": 100, "y": 100, "width": 1400, "height": 900}),
-            classify_grid_density=d.get("classify_grid_density", 96),
-            classify_grid_sort=d.get("classify_grid_sort", "filename"),
-            classify_preview_width=d.get("classify_preview_width", 320),
-            classify_preview_visible=d.get("classify_preview_visible", True),
+            classify=ClassifyViewState(
+                grid_density=grid_density,
+                grid_sort=grid_sort,
+                preview_width=preview_width,
+                preview_visible=preview_visible,
+            ),
             annotation_panel_splitter_sizes=splitter_sizes,
             annotation_panel_collapsed=collapsed,
             enable_locateanything=bool(d.get("enable_locateanything", True)),

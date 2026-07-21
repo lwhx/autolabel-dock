@@ -1,17 +1,16 @@
 """Tests for global app configuration."""
+import json
 from pathlib import Path
 
-from src.core.config import AppConfig
+from src.core.config import AppConfig, ClassifyViewState
 
 
 class TestAppConfig:
     def test_default_values(self):
         cfg = AppConfig()
         assert cfg.recent_projects == []
-        assert cfg.theme == "dark"
-        assert cfg.auto_save is True
-        assert cfg.default_conf_threshold == 0.5
         assert cfg.script_tools == {}
+        assert cfg.enable_locateanything is True
 
     def test_save_and_load(self, tmp_path):
         config_path = tmp_path / "config.json"
@@ -47,38 +46,130 @@ class TestAppConfig:
         loaded = AppConfig.load(config_path)
         assert loaded.script_tools == {"crop": "print('crop')\n"}
 
-    def test_classify_keys_default(self):
-        cfg = AppConfig()
-        assert cfg.classify_grid_density == 96
-        assert cfg.classify_grid_sort == "filename"
-        assert cfg.classify_preview_width == 320
-        assert cfg.classify_preview_visible is True
 
-    def test_classify_keys_roundtrip(self, tmp_path):
+class TestClassifySlice:
+    def test_slice_defaults(self):
+        cfg = AppConfig()
+        assert isinstance(cfg.classify, ClassifyViewState)
+        assert cfg.classify.grid_density == 96
+        assert cfg.classify.grid_sort == "filename"
+        assert cfg.classify.preview_width == 320
+        assert cfg.classify.preview_visible is True
+
+    def test_slice_instances_are_independent(self):
+        # default_factory — two configs must not share one slice.
+        a, b = AppConfig(), AppConfig()
+        a.classify.grid_density = 128
+        assert b.classify.grid_density == 96
+
+    def test_to_dict_flattens_to_legacy_flat_keys(self):
+        cfg = AppConfig(classify=ClassifyViewState(
+            grid_density=128, grid_sort="class",
+            preview_width=400, preview_visible=False,
+        ))
+        d = cfg.to_dict()
+        assert d["classify_grid_density"] == 128
+        assert d["classify_grid_sort"] == "class"
+        assert d["classify_preview_width"] == 400
+        assert d["classify_preview_visible"] is False
+        assert "classify" not in d  # no nested key on disk
+
+    def test_from_dict_picks_flat_keys(self):
+        cfg = AppConfig.from_dict({
+            "classify_grid_density": 144,
+            "classify_grid_sort": "class",
+            "classify_preview_width": 280,
+            "classify_preview_visible": False,
+        })
+        assert cfg.classify.grid_density == 144
+        assert cfg.classify.grid_sort == "class"
+        assert cfg.classify.preview_width == 280
+        assert cfg.classify.preview_visible is False
+
+    def test_from_dict_sanitizes_invalid_types(self):
+        cfg = AppConfig.from_dict({
+            "classify_grid_density": "big",
+            "classify_grid_sort": 7,
+            "classify_preview_width": None,
+            "classify_preview_visible": "yes",
+        })
+        assert cfg.classify.grid_density == 96
+        assert cfg.classify.grid_sort == "filename"
+        assert cfg.classify.preview_width == 320
+        assert cfg.classify.preview_visible is True
+
+    def test_roundtrip(self, tmp_path):
         config_path = tmp_path / "config.json"
-        cfg = AppConfig(
-            classify_grid_density=128,
-            classify_grid_sort="class",
-            classify_preview_width=400,
-            classify_preview_visible=False,
-        )
+        cfg = AppConfig()
+        cfg.classify.grid_density = 128
+        cfg.classify.grid_sort = "class"
+        cfg.classify.preview_width = 400
+        cfg.classify.preview_visible = False
         cfg.save(config_path)
         loaded = AppConfig.load(config_path)
-        assert loaded.classify_grid_density == 128
-        assert loaded.classify_grid_sort == "class"
-        assert loaded.classify_preview_width == 400
-        assert loaded.classify_preview_visible is False
+        assert loaded.classify == cfg.classify
 
-    def test_classify_keys_legacy_compat(self, tmp_path):
-        """旧 config.json 没这 4 个键 → 应使用默认值"""
-        import json
+    def test_legacy_file_without_classify_keys(self, tmp_path):
         config_path = tmp_path / "config.json"
-        config_path.write_text(json.dumps({"theme": "dark", "auto_save": True}))
+        config_path.write_text(json.dumps({"recent_projects": []}))
         cfg = AppConfig.load(config_path)
-        assert cfg.classify_grid_density == 96
-        assert cfg.classify_grid_sort == "filename"
-        assert cfg.classify_preview_width == 320
-        assert cfg.classify_preview_visible is True
+        assert cfg.classify == ClassifyViewState()
+
+
+class TestLegacyCompat:
+    """Compatibility matrix (a): a full 16-key legacy file must load losslessly
+    for all 11 live concepts, with the 5 dead keys silently ignored."""
+
+    LEGACY_16_KEYS = {
+        "recent_projects": ["/x", "/y"],
+        "theme": "dark",
+        "auto_save": True,
+        "default_conf_threshold": 0.5,
+        "default_iou_threshold": 0.45,
+        "overlap_iou_threshold": 0.5,
+        "script_tools": {"crop": "print('c')\n"},
+        "window_geometry": {"x": 1, "y": 2, "width": 800, "height": 600},
+        "classify_grid_density": 128,
+        "classify_grid_sort": "class",
+        "classify_preview_width": 400,
+        "classify_preview_visible": False,
+        "annotation_panel_splitter_sizes": [120, 220],
+        "annotation_panel_collapsed": {"Tag": True},
+        "enable_locateanything": False,
+    }
+
+    def test_full_legacy_file_loads_live_fields(self, tmp_path):
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(self.LEGACY_16_KEYS))
+        cfg = AppConfig.load(config_path)
+        assert cfg.recent_projects == ["/x", "/y"]
+        assert cfg.script_tools == {"crop": "print('c')\n"}
+        assert cfg.window_geometry == {"x": 1, "y": 2, "width": 800, "height": 600}
+        assert cfg.classify.grid_density == 128
+        assert cfg.classify.grid_sort == "class"
+        assert cfg.classify.preview_width == 400
+        assert cfg.classify.preview_visible is False
+        assert cfg.annotation_panel_splitter_sizes == [120, 220]
+        assert cfg.annotation_panel_collapsed == {"Tag": True}
+        assert cfg.enable_locateanything is False
+
+    def test_dead_fields_are_gone(self):
+        cfg = AppConfig()
+        for dead in ("theme", "auto_save", "default_conf_threshold",
+                     "default_iou_threshold", "overlap_iou_threshold"):
+            assert not hasattr(cfg, dead)
+            assert dead not in cfg.to_dict()
+
+    def test_resave_drops_dead_keys_keeps_live_key_names(self, tmp_path):
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(self.LEGACY_16_KEYS))
+        cfg = AppConfig.load(config_path)
+        cfg.save(config_path)
+        d = json.loads(config_path.read_text())
+        assert "theme" not in d and "auto_save" not in d
+        # Live flat key names unchanged on disk.
+        assert d["classify_grid_density"] == 128
+        assert d["classify_preview_visible"] is False
 
 
 class TestAnnotationPanelPersistence:

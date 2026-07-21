@@ -43,9 +43,6 @@ stdout by default — that would corrupt the protocol stream. So ``main()``
 captures the real stdout fd first (for protocol writes), then redirects
 ``sys.stdout`` to ``sys.stderr`` and routes transformers logging + tqdm to
 stderr. The parent redirects this worker's stderr to a log file for diagnosis.
-
-This loading / inference contract mirrors the ground-truth reference script
-``.trellis/tasks/06-08-locateanything-backend/research/locate_anything_4bit_reference.py``.
 """
 from __future__ import annotations
 

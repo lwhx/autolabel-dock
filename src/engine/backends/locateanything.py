@@ -32,9 +32,6 @@ Cost unlock is four-tier (startup stays at tier 0):
     2 preflight()— continue after probe: cheap nvidia-smi GPU/VRAM check (no torch).
     3 load_runtime() — preflight passed: spawn the worker subprocess; it does the
                   real torch CUDA check + 4-bit NF4 model load and reports back.
-
-The runtime / inference contract mirrors the ground-truth reference script
-``.trellis/tasks/06-08-locateanything-backend/research/locate_anything_4bit_reference.py``.
 """
 from __future__ import annotations
 
@@ -787,6 +784,15 @@ class LocateAnythingPredictor:
         raise BackendUnavailableError(
             "LocateAnything 仅支持检测任务，不支持分类。"
         )
+
+    def class_names(self) -> list[str]:
+        """Open-vocabulary backend: no fixed class list (``PredictorProtocol``).
+
+        LA detects from the natural-language prompt, so it has no model-side
+        vocabulary to advertise. Callers that diff a predictor's classes against
+        the project (e.g. new-class preview) correctly get an empty result.
+        """
+        return []
 
     def _run(
         self, image_path, project_classes: list[str] | None

@@ -81,6 +81,47 @@ class TaskView(QWidget):
         """
         return None
 
+    def set_image_status(self, path: Path, status: str) -> None:
+        """Optional override: mirror an externally-written record's status
+        into this view's per-image visuals/caches.
+
+        detect/pose: file_list.set_status(path, status) — used by the batch
+                     auto-label pipeline after it persists a record behind
+                     the view.
+        classify:    no-op (grid visuals are updated by the write path
+                     itself, e.g. add_auto_class_prediction).
+        Default: no-op.
+        """
+        return None
+
+    def cleanup(self) -> None:
+        """Optional override: release view-held resources on teardown.
+
+        classify: stops the background thumbnail loader and drains it.
+        detect/pose: no view-held background resources to release.
+        Default: no-op.
+        """
+        return None
+
+    def save_annotation_panel_state(self) -> dict | None:
+        """Optional override: return this view's AnnotationPanel state
+        (splitter sizes + per-section collapsed flags) for persistence.
+
+        detect/pose: ``self._ann_panel.save_state()``.
+        None (default) means "this view holds no panel state" — the shell
+        falls back to its cached pending copy. Note: ``None`` is the sentinel,
+        NOT ``{}`` (an empty dict is a valid state the shell would trust).
+        """
+        return None
+
+    def restore_annotation_panel_state(self, state: dict) -> None:
+        """Optional override: apply a previously-saved AnnotationPanel state.
+
+        detect/pose: ``self._ann_panel.restore_state(state)``.
+        Default: no-op (classify has no AnnotationPanel).
+        """
+        return None
+
     def get_focused_image(self) -> Path | None:
         raise NotImplementedError
 

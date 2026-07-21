@@ -5,6 +5,7 @@ import logging
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from PyQt5.QtCore import Qt, QRect, QSize, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QPainter, QPixmap
@@ -32,8 +33,8 @@ from PyQt5.QtWidgets import (
 from PyQt5 import sip
 
 from src.core.annotation import ImageAnnotation
-from src.core.config import AppConfig
-from src.core.label_io import load_annotation, save_annotation
+from src.core.config import ClassifyViewState
+from src.core.label_store import LabelStore
 from src.core.project import ProjectManager
 from src.ui.icons import icon
 from src.ui.theme import PALETTE, set_button_role, text_style
@@ -43,9 +44,6 @@ from src.utils.image import ImageCache, get_image_size, load_pixmap
 from src.utils.undo import UndoStack
 
 logger = logging.getLogger(__name__)
-
-
-_APP_CONFIG_PATH = lambda: Path.home() / ".autolabel" / "config.json"
 
 
 # ── Visual state ───────────────────────────────────────────────
@@ -266,10 +264,6 @@ class ThumbnailGridWidget(QListWidget):
         menu.exec_(event.globalPos())
 
 
-def _empty_ia(path: Path) -> ImageAnnotation:
-    return ImageAnnotation(image_path=path.name, image_size=(1, 1))
-
-
 # ── Preview pane ───────────────────────────────────────────────
 
 
@@ -280,9 +274,12 @@ class PreviewPane(QFrame):
     # Per-image user-tag edits — payload is the new list[str].
     user_tags_changed = pyqtSignal(list)
 
-    def __init__(self, image_cache: ImageCache, parent=None):
+    def __init__(self, image_cache: ImageCache, label_store: LabelStore | None = None, parent=None):
         super().__init__(parent)
         self._image_cache = image_cache
+        # Shared LabelStore (injected by the owning view); private fallback
+        # keeps isolated construction on plain label IO semantics.
+        self._store = label_store or LabelStore()
         self._project: ProjectManager | None = None
         self._current_path: Path | None = None
         self._init_ui()
@@ -355,7 +352,7 @@ class PreviewPane(QFrame):
         else:
             self._image_lbl.clear()
         ia = (
-            load_annotation(self._project.label_path_for(path))
+            self._store.load(self._project.label_path_for(path))
             if self._project is not None
             else None
         )
@@ -447,11 +444,24 @@ class ClassifyView(TaskView):
         self,
         image_cache: ImageCache,
         undo_stacks: "OrderedDict[str, UndoStack]",
+        label_store: LabelStore | None = None,
+        classify_state: ClassifyViewState | None = None,
+        save_config: Callable[[], None] | None = None,
         parent=None,
     ):
         super().__init__(parent)
         self._image_cache = image_cache
         self._undo_stacks = undo_stacks
+        # Shared LabelStore (injected by the shell) — reads flush pending
+        # edits first. Classify writes through immediately, so the flush is
+        # a no-op here, but all session label IO still goes through the store.
+        self._store = label_store or LabelStore()
+        # Shared ClassifyViewState slice of MainWindow's AppConfig (single
+        # in-memory authority): mutating fields in place IS the config update;
+        # the injected saver persists the whole shared config. None fallbacks
+        # (private slice + no-op saver) are for isolated tests only.
+        self._state = classify_state if classify_state is not None else ClassifyViewState()
+        self._save_config = save_config if save_config is not None else (lambda: None)
         self._project: ProjectManager | None = None
         self._classes: list[str] = []
         self._class_colors: dict[str, str] = {}
@@ -549,7 +559,7 @@ class ClassifyView(TaskView):
         self._grid = ThumbnailGridWidget()
         self._splitter.addWidget(self._grid)
 
-        self._preview = PreviewPane(self._image_cache)
+        self._preview = PreviewPane(self._image_cache, self._store)
         self._preview.closed.connect(self._on_preview_close)
         self._preview.user_tags_changed.connect(self._on_preview_user_tags_changed)
         self._splitter.addWidget(self._preview)
@@ -569,20 +579,16 @@ class ClassifyView(TaskView):
     def _on_density_changed(self, value: int) -> None:
         self._grid.setIconSize(QSize(value, value))
         self._grid.doItemsLayout()
-        cfg_path = _APP_CONFIG_PATH()
-        cfg = AppConfig.load(cfg_path)
-        cfg.classify_grid_density = value
-        cfg.save(cfg_path)
+        self._state.grid_density = value
+        self._save_config()
 
     def _on_sort_changed(self, _idx: int) -> None:
         if self._project is None:
             return
         sort_key = self._sort_combo.currentData()
         self._resort_items(sort_key)
-        cfg_path = _APP_CONFIG_PATH()
-        cfg = AppConfig.load(cfg_path)
-        cfg.classify_grid_sort = sort_key
-        cfg.save(cfg_path)
+        self._state.grid_sort = sort_key
+        self._save_config()
 
     def _resort_items(self, sort_key: str) -> None:
         if self._project is None or self._grid.count() == 0:
@@ -591,7 +597,7 @@ class ClassifyView(TaskView):
         for i in range(self._grid.count()):
             it = self._grid.item(i)
             path = Path(it.data(Qt.UserRole))
-            ia = load_annotation(self._project.label_path_for(path))
+            ia = self._store.load(self._project.label_path_for(path))
             tag = ia.image_tags[0] if (ia and ia.image_tags) else ""
             rows.append((path, tag, it))
 
@@ -624,25 +630,24 @@ class ClassifyView(TaskView):
         self._preview.set_project(project)
 
         # Apply persisted density before loading items so iconSize is correct.
-        cfg = AppConfig.load(_APP_CONFIG_PATH())
-        if self._density_slider.value() != cfg.classify_grid_density:
-            self._density_slider.setValue(cfg.classify_grid_density)
+        if self._density_slider.value() != self._state.grid_density:
+            self._density_slider.setValue(self._state.grid_density)
         else:
-            self._on_density_changed(cfg.classify_grid_density)
+            self._on_density_changed(self._state.grid_density)
 
         self._grid.clear()
         icon_size = self._grid.iconSize()
         for img in project.list_images():
-            ia = load_annotation(project.label_path_for(img)) or _empty_ia(img)
+            ia = self._store.load_or_empty(project.label_path_for(img), img.name)
             visual = _compute_visual_state(ia, self._class_colors)
             self._grid.add_image_item(img, visual, pixmap=None)
             self._loader.enqueue(img, icon_size)
 
         # Apply persisted sort (after items are present).
-        target_idx = 0 if cfg.classify_grid_sort == "filename" else 1
+        target_idx = 0 if self._state.grid_sort == "filename" else 1
         if self._sort_combo.currentIndex() != target_idx:
             self._sort_combo.setCurrentIndex(target_idx)
-        elif cfg.classify_grid_sort == "class":
+        elif self._state.grid_sort == "class":
             # Same index → no signal, but we still need to reorder.
             self._resort_items("class")
 
@@ -650,13 +655,12 @@ class ClassifyView(TaskView):
         self._update_confirm_all_count()
 
     def _apply_persisted_preview_state(self) -> None:
-        cfg = AppConfig.load(_APP_CONFIG_PATH())
-        self._preview.setVisible(cfg.classify_preview_visible)
-        if cfg.classify_preview_visible:
+        self._preview.setVisible(self._state.preview_visible)
+        if self._state.preview_visible:
             total = sum(self._splitter.sizes()) or 800
-            self._splitter.setSizes([max(total - cfg.classify_preview_width, 100),
-                                     cfg.classify_preview_width])
-        self._sync_preview_toggle(cfg.classify_preview_visible)
+            self._splitter.setSizes([max(total - self._state.preview_width, 100),
+                                     self._state.preview_width])
+        self._sync_preview_toggle(self._state.preview_visible)
 
     def _on_preview_close(self) -> None:
         sizes = self._splitter.sizes()
@@ -673,18 +677,15 @@ class ClassifyView(TaskView):
         if path is None:
             return
         label_path = self._project.label_path_for(path)
-        ia = load_annotation(label_path)
-        if ia is None:
-            from src.utils.image import get_image_size
-            w, h = get_image_size(path)
-            ia = ImageAnnotation(image_path=path.name, image_size=(w, h))
+        ia = self._store.load_or_empty(
+            label_path, path.name, image_size=get_image_size(path),
+        )
         ia.tags = [str(t) for t in new_tags]
-        save_annotation(ia, label_path)
+        self._store.save(ia, label_path)
         self.user_tags_changed.emit(path, list(ia.tags))
 
     def show_preview(self) -> None:
-        cfg = AppConfig.load(_APP_CONFIG_PATH())
-        w = cfg.classify_preview_width
+        w = self._state.preview_width
         total = sum(self._splitter.sizes()) or 800
         self._splitter.setSizes([max(total - w, 100), w])
         self._preview.setVisible(True)
@@ -706,11 +707,9 @@ class ClassifyView(TaskView):
         btn.blockSignals(False)
 
     def _save_preview_state(self, width: int, visible: bool) -> None:
-        cfg_path = _APP_CONFIG_PATH()
-        cfg = AppConfig.load(cfg_path)
-        cfg.classify_preview_width = width
-        cfg.classify_preview_visible = visible
-        cfg.save(cfg_path)
+        self._state.preview_width = width
+        self._state.preview_visible = visible
+        self._save_config()
 
     # ── Keyboard input ─────────────────────────────────────────
 
@@ -759,14 +758,13 @@ class ClassifyView(TaskView):
     ) -> None:
         path = Path(item.data(Qt.UserRole))
         label_path = self._project.label_path_for(path)
-        ia = load_annotation(label_path)
-        if ia is None:
-            w, h = get_image_size(path)
-            ia = ImageAnnotation(image_path=path.name, image_size=(w, h))
+        ia = self._store.load_or_empty(
+            label_path, path.name, image_size=get_image_size(path),
+        )
         ia.image_tags = [class_name]
         ia.image_tags_confirmed = confirmed
         ia.image_tags_source = source
-        save_annotation(ia, label_path)
+        self._store.save(ia, label_path)
         visual = _compute_visual_state(ia, self._class_colors)
         self._grid.update_visual(path, visual)
         self._push_undo_for(path)
@@ -786,11 +784,11 @@ class ClassifyView(TaskView):
         for item in self._selected_or_focused_items():
             path = Path(item.data(Qt.UserRole))
             label_path = self._project.label_path_for(path)
-            ia = load_annotation(label_path)
+            ia = self._store.load(label_path)
             if ia is None or not ia.image_tags or ia.image_tags_confirmed:
                 continue
             ia.image_tags_confirmed = True
-            save_annotation(ia, label_path)
+            self._store.save(ia, label_path)
             self._grid.update_visual(path, _compute_visual_state(ia, self._class_colors))
             self._push_undo_for(path)
             self.annotations_changed.emit(path)
@@ -802,13 +800,13 @@ class ClassifyView(TaskView):
         for item in self._selected_or_focused_items():
             path = Path(item.data(Qt.UserRole))
             label_path = self._project.label_path_for(path)
-            ia = load_annotation(label_path)
+            ia = self._store.load(label_path)
             if ia is None:
                 continue
             ia.image_tags = []
             ia.image_tags_confirmed = True
             ia.image_tags_source = "manual"
-            save_annotation(ia, label_path)
+            self._store.save(ia, label_path)
             self._grid.update_visual(path, _compute_visual_state(ia, self._class_colors))
             self._push_undo_for(path)
             self.annotations_changed.emit(path)
@@ -822,7 +820,7 @@ class ClassifyView(TaskView):
 
         labeled_count = 0
         for p in paths:
-            ia = load_annotation(self._project.label_path_for(p))
+            ia = self._store.load(self._project.label_path_for(p))
             if ia and ia.image_tags:
                 labeled_count += 1
 
@@ -928,7 +926,7 @@ class ClassifyView(TaskView):
         for i in range(self._grid.count()):
             it = self._grid.item(i)
             path = Path(it.data(Qt.UserRole))
-            ia = load_annotation(self._project.label_path_for(path))
+            ia = self._store.load(self._project.label_path_for(path))
             it.setHidden(self._compute_hidden(ia))
         self._restore_scroll_after_filter(current_item)
         self._request_confirm_all_count_update()
@@ -970,7 +968,7 @@ class ClassifyView(TaskView):
         item = self._grid.item_for_path(path)
         if item is None:
             return
-        ia = load_annotation(self._project.label_path_for(path))
+        ia = self._store.load(self._project.label_path_for(path))
         item.setHidden(self._compute_hidden(ia))
 
     def _restore_scroll_after_filter(self, current_item: QListWidgetItem | None) -> None:
@@ -991,7 +989,7 @@ class ClassifyView(TaskView):
             if it.isHidden():
                 continue
             path = Path(it.data(Qt.UserRole))
-            ia = load_annotation(self._project.label_path_for(path))
+            ia = self._store.load(self._project.label_path_for(path))
             if (
                 ia is not None
                 and ia.image_tags
@@ -1032,7 +1030,7 @@ class ClassifyView(TaskView):
                 continue
             path = Path(it.data(Qt.UserRole))
             label_path = self._project.label_path_for(path)
-            ia = load_annotation(label_path)
+            ia = self._store.load(label_path)
             if (
                 ia is None
                 or not ia.image_tags
@@ -1041,7 +1039,7 @@ class ClassifyView(TaskView):
             ):
                 continue
             ia.image_tags_confirmed = True
-            save_annotation(ia, label_path)
+            self._store.save(ia, label_path)
             self._grid.update_visual(path, _compute_visual_state(ia, self._class_colors))
             self._push_undo_for(path)
             self.annotations_changed.emit(path)
@@ -1068,8 +1066,8 @@ class ClassifyView(TaskView):
         cur = self.get_focused_image()
         if cur is None or self._project is None:
             return
-        ia = load_annotation(self._project.label_path_for(cur))
-        visual = _compute_visual_state(ia or _empty_ia(cur), self._class_colors)
+        ia = self._store.load_or_empty(self._project.label_path_for(cur), cur.name)
+        visual = _compute_visual_state(ia, self._class_colors)
         self._grid.update_visual(cur, visual)
 
     def commit_pending_save(self) -> None:
@@ -1081,7 +1079,7 @@ class ClassifyView(TaskView):
     def _push_undo_for(self, path: Path) -> None:
         if self._project is None:
             return
-        ia = load_annotation(self._project.label_path_for(path))
+        ia = self._store.load(self._project.label_path_for(path))
         if ia is None:
             return
         key = str(path)
@@ -1117,7 +1115,7 @@ class ClassifyView(TaskView):
 
     def _restore_state(self, path: Path, state: dict) -> None:
         ia = ImageAnnotation.from_dict(state)
-        save_annotation(ia, self._project.label_path_for(path))
+        self._store.save(ia, self._project.label_path_for(path))
         self._grid.update_visual(path, _compute_visual_state(ia, self._class_colors))
         self.annotations_changed.emit(path)
         self._request_confirm_all_count_update()
@@ -1136,16 +1134,15 @@ class ClassifyView(TaskView):
         if self._project is None:
             return False
         label_path = self._project.label_path_for(path)
-        ia = load_annotation(label_path)
-        if ia is not None and ia.image_tags and ia.image_tags_confirmed:
+        ia = self._store.load_or_empty(
+            label_path, path.name, image_size=get_image_size(path),
+        )
+        if ia.image_tags and ia.image_tags_confirmed:
             return False
-        if ia is None:
-            w, h = get_image_size(path)
-            ia = ImageAnnotation(image_path=path.name, image_size=(w, h))
         ia.image_tags = [class_name]
         ia.image_tags_confirmed = False
         ia.image_tags_source = "auto"
-        save_annotation(ia, label_path)
+        self._store.save(ia, label_path)
         self._grid.update_visual(path, _compute_visual_state(ia, self._class_colors))
         self._push_undo_for(path)
         self.annotations_changed.emit(path)

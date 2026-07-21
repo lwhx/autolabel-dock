@@ -25,7 +25,7 @@ from PyQt5.QtWidgets import (
     QComboBox,
 )
 
-from src.core.label_io import load_annotation
+from src.core.label_store import LabelStore
 from src.core.project import ProjectManager
 from src.core.tags import TagFilter
 from src.ui.icons import icon
@@ -65,14 +65,25 @@ class LabelPanel(QWidget):
 
     _UNDO_MAX_IMAGES = 20
 
-    def __init__(self, config_path=None, parent=None, tag_controller=None):
+    def __init__(self, config_path=None, parent=None, tag_controller=None,
+                 label_store=None, app_config=None):
         super().__init__(parent)
         self._project: ProjectManager | None = None
         self._undo_stacks: "OrderedDict[str, UndoStack]" = OrderedDict()
         self._image_cache = ImageCache(max_count=16, max_memory_mb=512.0)
         self._config_path = config_path
+        # Shared AppConfig (MainWindow-owned, single in-memory authority) —
+        # its .classify slice + a whole-config saver are injected into the
+        # classify view. None in isolated tests → view falls back to a
+        # private slice and a no-op saver.
+        self._app_config = app_config
         self._view: TaskView | None = None
         self._tag_ctrl = tag_controller  # may be None during isolated UI tests
+        # Shared LabelStore (MainWindow-owned) or a private one in isolated
+        # tests. Either way the shell owns the flush callback: reads through
+        # the store flush the active view's pending edit first.
+        self._label_store: LabelStore = label_store or LabelStore()
+        self._label_store.set_flush_callback(self.save_and_cleanup)
         self._pending_ann_panel_state: dict = {}
 
         self._init_ui()
@@ -187,15 +198,24 @@ class LabelPanel(QWidget):
 
     # ── Project routing ────────────────────────────────────────
 
-    def set_project(self, project: ProjectManager) -> None:
-        """Load a project and switch to the appropriate view by task_type."""
+    def set_project(self, project: ProjectManager, discard_pending: bool = False) -> None:
+        """Load a project and switch to the appropriate view by task_type.
+
+        ``discard_pending=True`` marks a Supersede: the label records on disk
+        were intentionally advanced past the in-memory view (import, batch
+        auto-label), so the old view's pending edit is discarded instead of
+        flushed — flushing would overwrite the newer records. The default
+        flushes the old view before teardown so pending edits survive
+        rebuilds (e.g. after the class manager).
+        """
+        if not discard_pending and self._view is not None:
+            self._view.commit_pending_save()
         self._project = project
         self._undo_stacks.clear()
 
         # Tear down previous view
         if self._view is not None:
-            if hasattr(self._view, "cleanup"):
-                self._view.cleanup()
+            self._view.cleanup()
             self._view_layout.removeWidget(self._view)
             self._view.setParent(None)
             self._view.deleteLater()
@@ -207,14 +227,28 @@ class LabelPanel(QWidget):
 
         task_type = project.config.task_type
         if task_type == "classify":
-            self._view = ClassifyView(self._image_cache, self._undo_stacks)
+            classify_state = None
+            save_config = None
+            if self._app_config is not None and self._config_path is not None:
+                classify_state = self._app_config.classify
+                cfg, path = self._app_config, self._config_path
+                save_config = lambda: cfg.save(path)  # noqa: E731
+            self._view = ClassifyView(
+                self._image_cache, self._undo_stacks,
+                label_store=self._label_store,
+                classify_state=classify_state,
+                save_config=save_config,
+            )
         else:
-            self._view = DetectPoseView(self._image_cache, self._undo_stacks)
+            self._view = DetectPoseView(
+                self._image_cache, self._undo_stacks,
+                label_store=self._label_store,
+            )
         self._view_layout.addWidget(self._view)
 
         # Push cached AnnotationPanel state into the new view (no-op for classify).
-        if hasattr(self._view, "_ann_panel") and self._pending_ann_panel_state:
-            self._view._ann_panel.restore_state(self._pending_ann_panel_state)
+        if self._pending_ann_panel_state:
+            self._view.restore_annotation_panel_state(self._pending_ann_panel_state)
 
         # Wire view → shell signals
         self._view.status_changed.connect(self.status_changed.emit)
@@ -283,26 +317,42 @@ class LabelPanel(QWidget):
     def set_annotation_panel_state(self, state: dict) -> None:
         """Cache state to apply to the next-mounted AnnotationPanel.
 
-        Pushes immediately if a view is already active and that view
-        embeds an AnnotationPanel (detect/pose views only; classify
-        views are no-ops).
+        Pushes immediately if a view is already active (no-op for views
+        without an AnnotationPanel — e.g., classify).
         """
         if not isinstance(state, dict):
             return
         self._pending_ann_panel_state = dict(state)
-        if self._view is not None and hasattr(self._view, "_ann_panel"):
-            self._view._ann_panel.restore_state(state)
+        if self._view is not None:
+            self._view.restore_annotation_panel_state(state)
 
     def get_annotation_panel_state(self) -> dict:
         """Return the live AnnotationPanel state, or the last-cached
-        pending state if no view is mounted (or the active view has no
-        AnnotationPanel — e.g., classify)."""
-        if self._view is not None and hasattr(self._view, "_ann_panel"):
-            return self._view._ann_panel.save_state()
+        pending state if no view is mounted (or the active view holds no
+        AnnotationPanel state — e.g., classify, which returns None)."""
+        if self._view is not None:
+            state = self._view.save_annotation_panel_state()
+            if state is not None:
+                return state
         return dict(self._pending_ann_panel_state)
 
     def get_current_image_path(self) -> Path | None:
         return self._view.get_focused_image() if self._view else None
+
+    def set_image_status(self, path: Path, status: str) -> None:
+        """Mirror an externally-written record's status into the active view
+        (detect/pose file list colors; no-op for classify)."""
+        if self._view:
+            self._view.set_image_status(path, status)
+
+    def reload_current(self) -> None:
+        """Reload the focused image's record from disk in the active view.
+
+        Used after a Supersede write (batch auto-label) advanced the record
+        behind the view — the view discards stale memory and re-reads.
+        """
+        if self._view:
+            self._view.reload_current()
 
     def add_auto_annotations(self, anns, overlap_iou: float = 0.5) -> None:
         if self._view:
@@ -335,7 +385,7 @@ class LabelPanel(QWidget):
         is_classify = self._project.config.task_type == "classify"
         for img_path in self._project.list_images():
             label_path = self._project.label_path_for(img_path)
-            ia = load_annotation(label_path)
+            ia = self._label_store.load(label_path)
             if ia is None:
                 result.append(img_path)
                 continue

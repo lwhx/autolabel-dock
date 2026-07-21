@@ -12,9 +12,8 @@ from pathlib import Path
 
 from PyQt5.QtCore import QObject, pyqtSignal
 
-from src.core.annotation import ImageAnnotation
 from src.core.backup import BackupManager
-from src.core.label_io import load_annotation, save_annotation
+from src.core.label_store import LabelStore
 from src.core.project import ProjectManager
 from src.core.tags import (
     TagError, TagFilter, TagService, dedupe_preserving_order, normalize,
@@ -33,10 +32,18 @@ class TagController(QObject):
     # Emitted when a single image's tag list changes (path, new_tags).
     image_tags_changed = pyqtSignal(object, list)
 
-    def __init__(self, parent: QObject | None = None):
+    def __init__(
+        self,
+        parent: QObject | None = None,
+        label_store: LabelStore | None = None,
+    ):
         super().__init__(parent)
         self._project: ProjectManager | None = None
         self._backup_mgr: BackupManager | None = None
+        # Shared LabelStore (MainWindow-owned): every record read below
+        # flushes the active view's pending edit first, so cascades
+        # (rename/remove) never operate on stale disk data.
+        self._store = label_store or LabelStore()
         self._tag_cache: dict[str, set[str]] | None = None
         # Any per-image or registry mutation invalidates the cache.
         self.image_tags_changed.connect(self._invalidate_tag_cache)
@@ -131,12 +138,13 @@ class TagController(QObject):
             self._project.save()
 
         label_path = self._project.label_path_for(image_path)
-        ia = load_annotation(label_path)
-        if ia is None:
-            w, h = get_image_size(image_path)
-            ia = ImageAnnotation(image_path=Path(image_path).name, image_size=(w, h))
+        ia = self._store.load_or_empty(
+            label_path,
+            Path(image_path).name,
+            image_size=get_image_size(image_path),
+        )
         ia.tags = normalized
-        save_annotation(ia, label_path)
+        self._store.save(ia, label_path)
 
         self.image_tags_changed.emit(Path(image_path), list(normalized))
         if added:
@@ -146,7 +154,7 @@ class TagController(QObject):
     def get_image_tags(self, image_path: Path) -> list[str]:
         if self._project is None:
             return []
-        ia = load_annotation(self._project.label_path_for(image_path))
+        ia = self._store.load(self._project.label_path_for(image_path))
         return list(ia.tags) if ia else []
 
     def register_new_tags(self, tags: list[str]) -> list[str]:
@@ -189,14 +197,13 @@ class TagController(QObject):
         for p in paths:
             try:
                 label_path = self._project.label_path_for(p)
-                ia = load_annotation(label_path)
-                if ia is None:
-                    w, h = get_image_size(p)
-                    ia = ImageAnnotation(image_path=Path(p).name, image_size=(w, h))
+                ia = self._store.load_or_empty(
+                    label_path, Path(p).name, image_size=get_image_size(p),
+                )
                 if tag_norm in ia.tags:
                     continue
                 ia.tags = list(ia.tags) + [tag_norm]
-                save_annotation(ia, label_path)
+                self._store.save(ia, label_path)
                 self.image_tags_changed.emit(Path(p), list(ia.tags))
                 modified += 1
             except (OSError, ValueError, KeyError):
@@ -216,7 +223,7 @@ class TagController(QObject):
         if self._project is None:
             return result
         for img in self._project.list_images():
-            ia = load_annotation(self._project.label_path_for(img))
+            ia = self._store.load(self._project.label_path_for(img))
             result[str(img)] = set(ia.tags) if ia else set()
         return result
 
@@ -235,11 +242,11 @@ class TagController(QObject):
             return
         for img in self._project.list_images():
             label_path = self._project.label_path_for(img)
-            ia = load_annotation(label_path)
+            ia = self._store.load(label_path)
             if ia is None or tag not in ia.tags:
                 continue
             ia.tags = [t for t in ia.tags if t != tag]
-            save_annotation(ia, label_path)
+            self._store.save(ia, label_path)
             self.image_tags_changed.emit(Path(img), list(ia.tags))
 
     def _rename_tag_in_all_images(self, old: str, new: str) -> None:
@@ -247,13 +254,13 @@ class TagController(QObject):
             return
         for img in self._project.list_images():
             label_path = self._project.label_path_for(img)
-            ia = load_annotation(label_path)
+            ia = self._store.load(label_path)
             if ia is None or old not in ia.tags:
                 continue
             ia.tags = dedupe_preserving_order(
                 new if t == old else t for t in ia.tags
             )
-            save_annotation(ia, label_path)
+            self._store.save(ia, label_path)
             self.image_tags_changed.emit(Path(img), list(ia.tags))
 
     # ── Filter breakdown ──────────────────────────────────────────

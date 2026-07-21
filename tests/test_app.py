@@ -112,7 +112,7 @@ class TestMainWindow:
         win = MainWindow(config_path=tmp_path / "config.json")
         win.open_project(pm)
 
-        assert win._train_panel._task_combo.currentText() == "classify"
+        assert win._train_panel.get_train_request().task == "classify"
         win.close()
 
     def test_open_project_shows_status(self, qapp, tmp_path):
@@ -530,7 +530,7 @@ class TestMainWindow:
             bbox=(0.5, 0.5, 0.2, 0.2),
             confirmed=False, source="auto",
         )
-        win._on_batch_image_done(str(img_path), [pred], (40, 40))
+        win._autolabel_ctrl._on_batch_image_done(str(img_path), [pred], (40, 40))
 
         # JSON saved with unconfirmed annotation
         ia = load_annotation(pm.label_path_for(img_path))
@@ -542,7 +542,7 @@ class TestMainWindow:
         win.close()
 
     def test_batch_finished_keeps_predictions_for_current_image(self, qapp, tmp_path):
-        """Regression: predictions on the focused unlabeled image must survive _on_batch_finished.
+        """Regression: predictions on the focused unlabeled image must survive the batch-finished reload.
 
         Bug: DetectPoseView.reload_current() routed through _on_image_selected,
         which calls _save_current() first. After the batch worker wrote
@@ -575,13 +575,13 @@ class TestMainWindow:
             bbox=(0.5, 0.5, 0.2, 0.2),
             confirmed=False, source="auto",
         )
-        win._on_batch_image_done(str(img_path), [pred], (40, 40))
+        win._autolabel_ctrl._on_batch_image_done(str(img_path), [pred], (40, 40))
 
         ia = load_annotation(pm.label_path_for(img_path))
         assert len(ia.annotations) == 1
 
         # The reload after batch finishes must NOT clobber disk with stale empty state
-        win._on_batch_finished()
+        win._autolabel_ctrl._on_batch_finished_ok()
 
         ia2 = load_annotation(pm.label_path_for(img_path))
         assert len(ia2.annotations) == 1, "reload_current() overwrote disk with stale empty state"
@@ -698,15 +698,16 @@ class TestMainWindow:
 
         win = MainWindow(config_path=tmp_path / "config.json")
         win.open_project(pm)
-        win._batch_skipped = 0
-        win._batch_failed = 0
+        ctrl = win._autolabel_ctrl
+        ctrl._batch_skipped = 0
+        ctrl._batch_failed = 0
 
         # Simulate worker emitting None payloads (predictor couldn't match class)
         for img in pm.list_images():
-            win._on_batch_image_done(str(img), None, (0, 0))
-        win._on_batch_finished()
+            ctrl._on_batch_image_done(str(img), None, (0, 0))
+        ctrl._on_batch_finished_ok()
 
-        assert win._batch_failed == 2
+        assert ctrl._batch_failed == 2
         assert "失败" in win._status_label.text() or "未识别" in win._status_label.text()
         win.close()
 
@@ -914,7 +915,7 @@ class TestLocateAnythingSingleAsync:
                     self.started += 1
 
             in_flight = _RunningWorker()
-            win._single_worker = in_flight
+            win._autolabel_ctrl._single_worker = in_flight
 
             built = []
 
@@ -930,7 +931,7 @@ class TestLocateAnythingSingleAsync:
 
             # Guard tripped: no new worker built, in-flight worker untouched.
             assert built == []
-            assert win._single_worker is in_flight
+            assert win._autolabel_ctrl._single_worker is in_flight
         finally:
             win.close()
 
@@ -1082,9 +1083,7 @@ class TestLocateAnythingYoloMutex:
                 side_effect=AssertionError("should not validate after decline")
             )
             # Simulate train_panel._on_start having flipped the button to running.
-            win._train_panel._btn_start.setEnabled(False)
-            win._train_panel._btn_start.setText("训练中")
-            win._train_panel._btn_stop.setEnabled(True)
+            win._train_panel.set_running_state(True)
             monkeypatch.setattr(
                 "src.app.QMessageBox.question", lambda *a, **k: QMessageBox.No,
             )
@@ -1097,5 +1096,74 @@ class TestLocateAnythingYoloMutex:
             assert win._train_panel._btn_start.isEnabled() is True
             assert win._train_panel._btn_start.text() == "开始训练"
             assert win._train_panel._btn_stop.isEnabled() is False
+        finally:
+            win.close()
+
+
+class TestTrainPanelSealedSeam:
+    """MainWindow ↔ TrainPanel interactions go through the public seam only."""
+
+    def test_app_source_never_touches_train_panel_privates(self):
+        """Structural regression: `grep '_train_panel\\._' src/app.py` must stay
+        empty — the seam is start_requested / get_train_request /
+        set_running_state / set_task_type plus the existing public members."""
+        import re
+
+        src = (
+            Path(__file__).resolve().parent.parent / "src" / "app.py"
+        ).read_text(encoding="utf-8")
+        assert not re.search(r"_train_panel\._", src)
+
+    def test_start_click_reaches_orchestration_via_start_requested(self, qapp, tmp_path):
+        """The start button is wired panel-internally; MainWindow listens on
+        the start_requested signal (the dead signal is alive now)."""
+        from unittest.mock import MagicMock
+
+        win = _win_with_project(tmp_path)
+        try:
+            win._train_ctrl.validate_and_prepare = MagicMock(return_value=None)
+
+            win._train_panel._btn_start.click()
+
+            win._train_ctrl.validate_and_prepare.assert_called_once()
+        finally:
+            win.close()
+
+    def test_validation_failure_fully_restores_start_button(self, qapp, tmp_path):
+        """Intentional fix: when validate_and_prepare returns None the button
+        must come back enabled AND relabelled 开始训练 (it used to stick at a
+        clickable 训练中)."""
+        from unittest.mock import MagicMock
+
+        win = _win_with_project(tmp_path)
+        try:
+            win._train_ctrl.validate_and_prepare = MagicMock(return_value=None)
+
+            # Real click path: the panel flips itself to the running state
+            # first, orchestration runs second and must restore idle.
+            win._train_panel._btn_start.click()
+
+            assert win._train_panel._btn_start.isEnabled() is True
+            assert win._train_panel._btn_start.text() == "开始训练"
+            assert win._train_panel._btn_stop.isEnabled() is False
+        finally:
+            win.close()
+
+    def test_validate_and_prepare_receives_request_fields(self, qapp, tmp_path):
+        """The orchestration reads task/val_ratio/kpt_shape/tag_filter from
+        get_train_request() — detect project → kpt_shape None."""
+        from unittest.mock import MagicMock
+
+        win = _win_with_project(tmp_path)
+        try:
+            win._train_ctrl.validate_and_prepare = MagicMock(return_value=None)
+
+            win._train_panel._btn_start.click()
+
+            args, kwargs = win._train_ctrl.validate_and_prepare.call_args
+            assert args[1] == "detect"
+            assert args[2] == win._train_panel.get_val_ratio()
+            assert kwargs["kpt_shape"] is None
+            assert kwargs["tag_filter"].is_empty()
         finally:
             win.close()

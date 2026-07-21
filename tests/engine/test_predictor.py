@@ -210,3 +210,35 @@ class TestPredictor:
         annotations, img_size = predictor.predict_with_size("test.jpg", conf=0.5, iou=0.45)
 
         assert img_size == (1920, 1080)
+
+
+class TestClassNames:
+    """Predictor.class_names() — PredictorProtocol capability seam."""
+
+    def test_dict_names_sorted_by_key(self):
+        mock_model = MagicMock()
+        mock_model.names = {1: "bike", 0: "person", 2: "car"}
+        assert Predictor(mock_model).class_names() == ["person", "bike", "car"]
+
+    def test_list_names_preserve_order(self):
+        mock_model = MagicMock()
+        mock_model.names = ["person", "bike", "car"]
+        assert Predictor(mock_model).class_names() == ["person", "bike", "car"]
+
+    def test_tuple_names_preserve_order(self):
+        mock_model = MagicMock()
+        mock_model.names = ("cat", "dog")
+        assert Predictor(mock_model).class_names() == ["cat", "dog"]
+
+    def test_empty_names_returns_empty(self):
+        mock_model = MagicMock()
+        mock_model.names = {}
+        assert Predictor(mock_model).class_names() == []
+
+    def test_missing_names_returns_empty(self):
+        mock_model = MagicMock(spec=[])  # no .names attribute
+        assert Predictor(mock_model).class_names() == []
+
+    def test_last_dropped_is_zero(self):
+        """YOLO is fixed-vocabulary: it never drops on a name mismatch."""
+        assert Predictor(MagicMock()).last_dropped == 0

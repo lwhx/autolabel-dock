@@ -132,6 +132,22 @@ class TestCanvasState:
         assert canvas._selected_id is None
         assert canvas._image is None
 
+    def test_consume_draw_start_returns_and_clears(self, qapp):
+        from src.ui.canvas import AnnotationCanvas
+
+        canvas = AnnotationCanvas()
+        canvas._draw_start = (0.3, 0.7)
+        assert canvas.consume_draw_start() == (0.3, 0.7)
+        assert canvas._draw_start is None
+        # Second consume: already cleared → None
+        assert canvas.consume_draw_start() is None
+
+    def test_consume_draw_start_none_when_unset(self, qapp):
+        from src.ui.canvas import AnnotationCanvas
+
+        canvas = AnnotationCanvas()
+        assert canvas.consume_draw_start() is None
+
 
 class TestCanvasSelection:
     def test_select_annotation(self, qapp):

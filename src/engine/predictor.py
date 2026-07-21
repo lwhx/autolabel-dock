@@ -12,6 +12,10 @@ logger = logging.getLogger(__name__)
 class Predictor:
     """Wraps a YOLO model for inference, converting results to Annotations."""
 
+    # Fixed-vocabulary backend: YOLO never drops detections on a name mismatch,
+    # so the protocol's ``last_dropped`` count is always 0 (class attribute).
+    last_dropped: int = 0
+
     def __init__(self, model):
         """Initialize with a loaded ultralytics YOLO model instance."""
         self.model = model
@@ -20,6 +24,21 @@ class Predictor:
         """No-op release. Ultralytics models share the in-process runtime and
         don't require explicit GPU teardown; provided so the predictor satisfies
         the optional ``PredictorProtocol.release`` hook used by ModelController."""
+
+    def class_names(self) -> list[str]:
+        """Return the model's class names as a list (``PredictorProtocol``).
+
+        ``model.names`` is ``{0: 'person', 1: 'bike'}`` (dict) or a plain
+        list/tuple depending on the ultralytics version; both are normalized to
+        ``list[str]``. Dict keys are sorted so the order is stable and matches
+        the class-id ordering. Missing/unrecognized metadata yields ``[]``.
+        """
+        names = getattr(self.model, "names", None)
+        if isinstance(names, dict):
+            return [str(names[k]) for k in sorted(names)]
+        if isinstance(names, (list, tuple)):
+            return [str(n) for n in names]
+        return []
 
     @staticmethod
     def _normalize_class_name(class_name: str) -> str:

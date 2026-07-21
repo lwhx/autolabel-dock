@@ -21,8 +21,8 @@ from PyQt5.QtCore import Qt
 
 from src.core.config import AppConfig
 from src.core.project import ProjectManager
-from src.core.annotation import ImageAnnotation
-from src.core.label_io import load_annotation
+from src.core.label_store import LabelStore
+from src.core.autolabel import InferenceParams
 from src.ui.label_panel import LabelPanel
 from src.ui.train_panel import TrainPanel
 from src.ui.model_panel import ModelPanel
@@ -30,11 +30,11 @@ from src.ui.script_tool_panel import ScriptToolPanel
 from src.ui.dialogs import BatchProgressDialog
 from src.ui.theme import set_button_role, set_surface, text_style
 from src.engine.model_manager import ModelRegistry
-from src.utils.workers import BatchPredictWorker
 from src.controllers.project import ProjectController
 from src.controllers.model import ModelController
 from src.controllers.train import TrainController
 from src.controllers.tags import TagController
+from src.controllers.autolabel import AutoLabelController
 from src.controllers.locateanything import LocateAnythingController
 from src.core.train_templates import TemplateRegistry
 from src.ui.icons import icon
@@ -138,11 +138,20 @@ class MainWindow(QMainWindow):
         geo = self._app_config.window_geometry
         self.setGeometry(geo["x"], geo["y"], geo["width"], geo["height"])
 
+        # Shared LabelStore — the single read/write face for label records.
+        # Its flush callback is installed by LabelPanel's constructor
+        # (save_and_cleanup, which delegates to the active view); every
+        # store-mediated read flushes pending edits first.
+        self._label_store = LabelStore()
+
         # Controllers
-        self._project_ctrl = ProjectController(self._app_config, self._config_path, self)
+        self._project_ctrl = ProjectController(
+            self._app_config, self._config_path, self,
+            label_store=self._label_store,
+        )
         self._model_ctrl = ModelController(self)
-        self._train_ctrl = TrainController(self)
-        self._tag_ctrl = TagController(self)
+        self._train_ctrl = TrainController(self, label_store=self._label_store)
+        self._tag_ctrl = TagController(self, label_store=self._label_store)
         self._tag_ctrl.tags_changed.connect(self._refresh_train_tag_breakdown)
         self._tag_ctrl.image_tags_changed.connect(self._refresh_train_tag_breakdown)
         # LocateAnything optional backend controller — drives probe/preflight/load.
@@ -153,6 +162,19 @@ class MainWindow(QMainWindow):
         self._la_ctrl.enabled.connect(self._on_la_enabled)
         self._la_ctrl.disabled.connect(self._on_la_disabled)
         self._la_ctrl.failed.connect(self._on_la_failed)
+        # AutoLabel deep module — owns the predict → merge → persist pipeline
+        # for single/batch auto-labeling. MainWindow keeps only the forwarding
+        # slots and the progress-dialog shell (signals wired after the status
+        # bar exists, below). Thread decision (sync YOLO vs async slow backend)
+        # lives in the controller, driven by the injected predicate.
+        self._autolabel_ctrl = AutoLabelController(
+            self._model_ctrl,
+            self._project_ctrl,
+            self._label_store,
+            slow_backend_active=lambda: self._la_ctrl.is_active,
+            params_provider=self._collect_inference_params,
+            parent_widget=self,
+        )
 
         # Global template registry — shared across projects
         self._template_registry = TemplateRegistry(TEMPLATES_PATH)
@@ -165,10 +187,9 @@ class MainWindow(QMainWindow):
         self._model_panel: ModelPanel | None = None
         self._script_tool_panel: ScriptToolPanel | None = None
         self._model_registry: ModelRegistry | None = None
-        self._batch_worker: BatchPredictWorker | None = None
+        # Progress-dialog shell for batch auto-label (workers/counters live in
+        # AutoLabelController; only the dialog belongs to the window).
         self._batch_dialog: BatchProgressDialog | None = None
-        # Background worker for single-image inference on slow backends (LA).
-        self._single_worker = None
 
         # Central widget
         self.tab_widget = QTabWidget()
@@ -188,6 +209,15 @@ class MainWindow(QMainWindow):
         self._status_label = QLabel("就绪")
         self.statusBar().addPermanentWidget(self._status_label)
         self._set_project_dir_label(None)
+
+        # AutoLabelController signal wiring (needs the status label above).
+        self._autolabel_ctrl.status_message.connect(self._status_label.setText)
+        self._autolabel_ctrl.batch_started.connect(self._on_autolabel_batch_started)
+        self._autolabel_ctrl.batch_progress.connect(self._on_autolabel_batch_progress)
+        self._autolabel_ctrl.batch_finished.connect(self._on_autolabel_batch_finished)
+        self._autolabel_ctrl.classes_registered.connect(
+            self._on_autolabel_classes_registered
+        )
 
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
 
@@ -278,9 +308,13 @@ class MainWindow(QMainWindow):
         self._model_ctrl.set_context(project_manager, self._model_registry)
 
         if self._label_panel is None:
+            # The panel installs its save_and_cleanup as the shared store's
+            # flush callback (stable across view swaps).
             self._label_panel = LabelPanel(
                 config_path=self._config_path,
                 tag_controller=self._tag_ctrl,
+                label_store=self._label_store,
+                app_config=self._app_config,
             )
             self._label_panel.auto_label_single_requested.connect(self._on_auto_label_single)
             self._label_panel.auto_label_batch_requested.connect(self._on_auto_label_batch)
@@ -305,10 +339,14 @@ class MainWindow(QMainWindow):
             self._la_ctrl.disable()
         self._label_panel.set_la_enabled_state(False)
         self._label_panel.set_project(project_manager)
+        # Bind the auto-label pipeline to the (new) project + panel.
+        self._autolabel_ctrl.set_context(project_manager, self._label_panel)
 
         if self._train_panel is None:
             self._train_panel = TrainPanel()
-            self._train_panel._btn_start.clicked.connect(self._on_start_training)
+            # The panel's own _on_start slot flips it to the running state and
+            # only then emits start_requested — orchestration runs second.
+            self._train_panel.start_requested.connect(self._on_start_training)
             self._train_panel.stop_requested.connect(self._on_stop_training)
             self._train_panel.preview_augmentation_requested.connect(self._on_preview_augmentation)
             self._train_panel.filter_changed.connect(self._on_train_tag_filter_changed)
@@ -342,7 +380,7 @@ class MainWindow(QMainWindow):
             self.tab_widget.addTab(self._script_tool_panel, icon("script_tab"), "小工具")
 
         self._script_tool_panel.set_working_directory(project_manager.project_dir)
-        self._train_panel._task_combo.setCurrentText(project_manager.config.task_type)
+        self._train_panel.set_task_type(project_manager.config.task_type)
         self._model_panel.set_models(self._model_registry.list_models())
         self._train_panel.set_registered_models(self._model_registry.list_models())
 
@@ -375,8 +413,8 @@ class MainWindow(QMainWindow):
     def _on_export(self) -> None:
         if not self._project:
             return
-        if self._label_panel:
-            self._label_panel.save_and_cleanup()
+        # No explicit flush: the export read path (ProjectController.export)
+        # collects records through the LabelStore, which flushes first.
         try:
             self._project_ctrl.export(self._project)
             self._status_label.setText("导出完成")
@@ -387,12 +425,16 @@ class MainWindow(QMainWindow):
         if not self._project:
             return
         if self._label_panel:
+            # Import is a Supersede: commit the user's pending edits BEFORE
+            # the importer advances the records past the in-memory view.
             self._label_panel.save_and_cleanup()
         count = self._project_ctrl.import_annotations(self._project)
         if count is not None and count > 0:
-            # Refresh label panel to show imported annotations
+            # Refresh label panel to show imported annotations. discard_pending:
+            # disk was intentionally advanced (Supersede) — flushing the stale
+            # view during teardown would overwrite the merged records.
             if self._label_panel:
-                self._label_panel.set_project(self._project)
+                self._label_panel.set_project(self._project, discard_pending=True)
             self._status_label.setText(f"导入完成: {count} 个图片")
         elif count == 0:
             self._status_label.setText("导入完成: 无匹配图片")
@@ -402,6 +444,8 @@ class MainWindow(QMainWindow):
             return
         if self._project_ctrl.manage_classes(self._project):
             if self._label_panel:
+                # Default set_project flushes the old view's pending edit
+                # before teardown — the rebuild must not drop canvas edits.
                 self._label_panel.set_project(self._project)
 
     def _on_tag_manager(self) -> None:
@@ -625,322 +669,58 @@ class MainWindow(QMainWindow):
             dlg.load_from_path(p)
         dlg.exec_()
 
-    # ── Auto-label ───────────────────────────────────────────
+    # ── Auto-label (forwarding slots + progress-dialog shell) ──
+    # Orchestration lives in AutoLabelController (src/controllers/autolabel.py):
+    # task_type dispatch, sync/async thread decision, conflict merging and
+    # LabelStore persistence. MainWindow only forwards the toolbar intents and
+    # hosts the modal progress dialog.
 
     def _on_auto_label_single(self) -> None:
-        if not self._label_panel or not self._project:
-            return
-        # Re-entrancy guard: a slow-backend (LA) single-image inference is still
-        # running on the worker thread. Disabling the toolbar buttons blocks
-        # mouse clicks, but the Shift+A shortcut emits the request directly, so
-        # guard here to avoid stacking overlapping workers (and leaking the
-        # in-flight QThread reference).
-        if self._single_worker is not None and self._single_worker.isRunning():
-            return
-        img_path = self._label_panel.get_current_image_path()
-        if not img_path:
-            return
-        if self._project.config.task_type == "classify":
-            result = self._model_ctrl.predict_single_classify(
-                img_path, self._project.config.classes,
-            )
-            if result is None:
-                self._status_label.setText("自动标注: 未识别")
-                return
-            raw_name, conf = result
-            reg = self._project_ctrl.register_auto_class(raw_name)
-            if reg.action in ("registered", "existing"):
-                applied_name = reg.applied_name
-                if reg.action == "registered" and self._label_panel:
-                    # Refresh class buttons & filter combo so the new class is visible.
-                    self._label_panel.set_project(self._project)
-                applied = self._label_panel.add_auto_class_prediction(
-                    img_path, applied_name, conf,
-                )
-                if not applied:
-                    self._status_label.setText("自动标注: 已存在确认标签，跳过")
-                else:
-                    suffix = (
-                        f" (新增类别 '{applied_name}')"
-                        if reg.action == "registered" else ""
-                    )
-                    self._status_label.setText(
-                        f"自动标注: {applied_name} ({conf:.2f}){suffix}"
-                    )
-            elif reg.action == "rejected_disabled":
-                if raw_name in self._project.config.classes:
-                    applied = self._label_panel.add_auto_class_prediction(
-                        img_path, raw_name, conf,
-                    )
-                    if not applied:
-                        self._status_label.setText("自动标注: 已存在确认标签，跳过")
-                    else:
-                        self._status_label.setText(
-                            f"自动标注: {raw_name} ({conf:.2f})"
-                        )
-                else:
-                    self._status_label.setText(
-                        f"自动标注: 类别 '{raw_name}' 不在项目中，已跳过（未开启自动登记）"
-                    )
-            elif reg.action == "rejected_blacklist":
-                self._status_label.setText(
-                    f"自动标注: 模型类名 '{raw_name}' 不可用（疑似 ImageNet ID），已跳过"
-                )
-            else:
-                self._status_label.setText("自动标注: 模型类名无效，已跳过")
-            return
-        conf = self._model_panel.get_conf_threshold() if self._model_panel else 0.5
-        iou = self._model_panel.get_iou_threshold() if self._model_panel else 0.45
-        overlap_iou = self._model_panel.get_overlap_iou_threshold() if self._model_panel else 0.5
-        class_match_mode = self._model_panel.get_class_match_mode() if self._model_panel else "class_id"
-
-        # Slow backends (LocateAnything) block for seconds inside predict(). On a
-        # single-GPU box the X server shares the same card, so running that on
-        # the Qt/X event loop stalls — and can crash — the desktop. Route slow
-        # backends through a background worker; keep YOLO synchronous (fast, and
-        # existing tests depend on the synchronous path).
-        if self._la_ctrl.is_active:
-            self._start_async_single_auto_label(
-                img_path, conf, iou, overlap_iou, class_match_mode,
-            )
-            return
-
-        annotations = self._model_ctrl.predict_single(
-            img_path,
-            self._project.config.classes,
-            conf=conf,
-            iou=iou,
-            class_match_mode=class_match_mode,
-        )
-        self._apply_single_auto_label_result(annotations, overlap_iou)
-
-    def _start_async_single_auto_label(
-        self, img_path, conf, iou, overlap_iou, class_match_mode,
-    ) -> None:
-        """Run single-image inference on a worker thread (slow backends).
-
-        Disables the auto-label buttons for the duration so the user can't stack
-        overlapping inference requests, then applies the result on the main
-        thread via the same ``add_auto_annotations`` path as the sync flow.
-        """
-        worker = self._model_ctrl.create_single_predict_worker(
-            img_path,
-            self._project.config.classes,
-            conf=conf,
-            iou=iou,
-            class_match_mode=class_match_mode,
-        )
-        if worker is None:
-            return
-        if self._label_panel:
-            self._label_panel.set_auto_label_busy(True)
-        self._status_label.setText("自动标注进行中…")
-        self._single_worker = worker
-        # Bind overlap_iou for the result slot without re-reading the panel.
-        worker.done.connect(
-            lambda anns: self._on_single_auto_label_done(anns, overlap_iou)
-        )
-        worker.error.connect(self._on_single_auto_label_error)
-        worker.finished.connect(self._on_single_auto_label_worker_finished)
-        worker.start()
-
-    def _on_single_auto_label_done(self, annotations, overlap_iou: float) -> None:
-        self._apply_single_auto_label_result(annotations, overlap_iou)
-
-    def _on_single_auto_label_error(self, message: str) -> None:
-        self._status_label.setText("自动标注失败")
-        QMessageBox.warning(self, "自动标注失败", message)
-
-    def _on_single_auto_label_worker_finished(self) -> None:
-        if self._label_panel:
-            self._label_panel.set_auto_label_busy(False)
-        self._single_worker = None
-
-    def _apply_single_auto_label_result(self, annotations, overlap_iou: float) -> None:
-        """Apply single-image predictions to the canvas (shared sync/async).
-
-        Surfaces the open-vocabulary 'dropped unmatched class' count when the
-        active predictor reports one (LocateAnything).
-        """
-        if not self._label_panel:
-            return
-        # Open-vocabulary backends (e.g. LocateAnything) drop detections whose
-        # name didn't match any project class — surface that count if present.
-        dropped = getattr(self._model_ctrl.predictor, "last_dropped", 0) or 0
-        drop_suffix = f"，丢弃 {dropped} 个未匹配类别" if dropped else ""
-        if annotations:
-            self._label_panel.add_auto_annotations(annotations, overlap_iou=overlap_iou)
-            self._status_label.setText(
-                f"自动标注: 检测到 {len(annotations)} 个目标{drop_suffix}"
-            )
-        else:
-            self._status_label.setText(f"自动标注: 未检测到目标{drop_suffix}")
+        self._autolabel_ctrl.label_current()
 
     def _on_auto_label_batch(self) -> None:
-        if not self._model_ctrl.predictor:
-            QMessageBox.information(self, "提示", "请先在模型面板中加载一个模型")
-            return
-        if not self._label_panel or not self._project:
-            return
-        self._label_panel.save_and_cleanup()
+        self._autolabel_ctrl.label_batch()
 
-        # Classification pre-flight: validate / register new model classes.
-        if self._project.config.task_type == "classify":
-            cfg = self._project.config
-            if not cfg.classes and not cfg.auto_register_classes:
-                QMessageBox.information(
-                    self, "提示",
-                    "项目当前没有类别，且未开启自动登记。\n"
-                    "请先在『类别管理』中添加类别，或开启自动登记后重试。",
-                )
-                return
-            if cfg.auto_register_classes:
-                preview_items = self._project_ctrl.preview_model_classes(
-                    self._model_ctrl.predictor,
-                )
-                if preview_items:
-                    from src.ui.dialogs import ClassRegisterDialog
-                    dlg = ClassRegisterDialog(preview_items, parent=self)
-                    if not dlg.exec_():
-                        return
-                    selected = dlg.get_selected()
-                    new_count = 0
-                    for raw in selected:
-                        result = self._project_ctrl.register_auto_class(raw, force=True)
-                        if result.action == "registered":
-                            new_count += 1
-                    if new_count and self._label_panel:
-                        # Refresh class bar / filter combo for the newly registered classes.
-                        self._label_panel.set_project(self._project)
+    def _collect_inference_params(self) -> InferenceParams:
+        """Assemble inference thresholds from ModelPanel's public getters.
 
-        all_images = self._project.list_images()
-        unlabeled = self._label_panel.get_unlabeled_image_paths()
-
-        items = ["仅未标注图片", "全部图片"]
-        from PyQt5.QtWidgets import QInputDialog
-        choice, ok = QInputDialog.getItem(
-            self, "批量自动标注", f"选择范围 (未标注: {len(unlabeled)} / 全部: {len(all_images)})",
-            items, 0, False,
+        The panel is created lazily on first project open; before that the
+        ``InferenceParams`` defaults mirror the historical fallbacks.
+        """
+        if not self._model_panel:
+            return InferenceParams()
+        return InferenceParams(
+            conf=self._model_panel.get_conf_threshold(),
+            iou=self._model_panel.get_iou_threshold(),
+            overlap_iou=self._model_panel.get_overlap_iou_threshold(),
+            class_match_mode=self._model_panel.get_class_match_mode(),
         )
-        if not ok:
-            return
 
-        target_images = unlabeled if choice == items[0] else all_images
-        if not target_images:
-            QMessageBox.information(self, "提示", "没有需要处理的图片")
-            return
-
-        conf = self._model_panel.get_conf_threshold() if self._model_panel else 0.5
-        iou = self._model_panel.get_iou_threshold() if self._model_panel else 0.45
-        class_match_mode = self._model_panel.get_class_match_mode() if self._model_panel else "class_id"
-
-        self._batch_worker = BatchPredictWorker(
-            predictor=self._model_ctrl.predictor,
-            image_paths=target_images,
-            conf=conf, iou=iou,
-            project_classes=self._project.config.classes,
-            class_match_mode=class_match_mode,
-            task=self._project.config.task_type,
-        )
-        self._batch_skipped = 0
-        self._batch_failed = 0
-        self._batch_worker.progress.connect(self._on_batch_progress)
-        self._batch_worker.image_done.connect(self._on_batch_image_done)
-        self._batch_worker.finished_ok.connect(self._on_batch_finished)
-        self._batch_worker.error.connect(self._on_batch_error)
-        self._batch_worker.finished.connect(self._on_batch_worker_finished)
-        if self._project.config.task_type == "classify":
-            self._label_panel.begin_bulk_auto_label_update()
-        self._batch_worker.start()
-
-        self._batch_dialog = BatchProgressDialog("批量自动标注", len(target_images), self)
-        self._batch_dialog.cancelled.connect(self._batch_worker.cancel)
+    def _on_autolabel_batch_started(self, total: int) -> None:
+        self._batch_dialog = BatchProgressDialog("批量自动标注", total, self)
+        self._batch_dialog.cancelled.connect(self._autolabel_ctrl.cancel_batch)
         self._batch_dialog.show()
-        self._status_label.setText(f"批量标注进行中: 0/{len(target_images)}")
 
-    def _on_batch_progress(self, current: int, total: int) -> None:
-        self._status_label.setText(f"批量标注进行中: {current}/{total}")
+    def _on_autolabel_batch_progress(self, current: int, total: int) -> None:
         if self._batch_dialog:
             self._batch_dialog.update_progress(current, total)
 
-    def _on_batch_image_done(self, path_str: str, payload, img_size) -> None:
-        if not self._project:
-            return
-        img_path = Path(path_str)
-        if self._project.config.task_type == "classify":
-            if payload is None:
-                self._batch_failed += 1
-                return
-            if not self._label_panel:
-                return
-            raw_name, conf = payload
-            # Worker returns raw class names (filter_to_project=False); names
-            # not in project.classes (either user did not approve in pre-dialog
-            # or auto_register is OFF) are skipped here. We deliberately do not
-            # call register_auto_class — that would mutate project state from a
-            # non-GUI context if/when this slot is ever invoked off the main
-            # thread.
-            if raw_name not in self._project.config.classes:
-                self._batch_skipped += 1
-                return
-            applied = self._label_panel.add_auto_class_prediction(
-                img_path, raw_name, conf,
-            )
-            if not applied:
-                self._batch_skipped += 1
-            return
-        annotations = payload
-        label_path = self._project.label_path_for(img_path)
-        ia = load_annotation(label_path)
-        if ia is None:
-            ia = ImageAnnotation(image_path=img_path.name, image_size=img_size)
-        # Filter out predictions that overlap with existing confirmed annotations
-        from src.core.annotation import find_conflicts
-        overlap_iou = self._model_panel.get_overlap_iou_threshold() if self._model_panel else 0.5
-        _, clean_preds = find_conflicts(ia.annotations, annotations, overlap_iou)
-        for ann in clean_preds:
-            ia.annotations.append(ann)
-        from src.core.label_io import save_annotation
-        save_annotation(ia, label_path)
-        if self._label_panel and self._label_panel._view is not None:
-            self._label_panel._view._file_list.set_status(img_path, ia.status)
-
-    def _on_batch_finished(self) -> None:
-        skipped = getattr(self, "_batch_skipped", 0)
-        failed = getattr(self, "_batch_failed", 0)
-        notes = []
-        if skipped > 0:
-            notes.append(f"跳过 {skipped} 张已确认")
-        if failed > 0:
-            notes.append(f"失败 {failed} 张未识别")
-        if notes:
-            self._status_label.setText("批量自动标注完成（" + "，".join(notes) + "）")
-        else:
-            self._status_label.setText("批量自动标注完成")
+    def _on_autolabel_batch_finished(self, summary: str) -> None:
+        """Terminal for every batch outcome (completed / failed / cancelled)."""
         if self._batch_dialog:
             self._batch_dialog.close()
             self._batch_dialog = None
-        if self._label_panel and self._label_panel.get_current_image_path():
-            self._label_panel._view.reload_current()
+        self._status_label.setText(summary)
 
-    def _on_batch_error(self, msg: str) -> None:
-        self._status_label.setText("批量标注失败")
-        if self._batch_dialog:
-            self._batch_dialog.close()
-            self._batch_dialog = None
-        QMessageBox.warning(self, "批量标注失败", msg)
+    def _on_autolabel_classes_registered(self) -> None:
+        """New classes registered from model output → rebuild class widgets.
 
-    def _on_batch_worker_finished(self) -> None:
-        if self._label_panel:
-            self._label_panel.end_bulk_auto_label_update()
-        # On cancel, neither finished_ok nor error fired, so the dialog is still
-        # open. Close it here and surface a status message.
-        if self._batch_dialog is not None:
-            cancelled = self._batch_dialog.is_cancelled
-            self._batch_dialog.close()
-            self._batch_dialog = None
-            if cancelled:
-                self._status_label.setText("批量标注已取消")
+        Supersede-adjacent rebuild: classify writes through (nothing pending
+        to flush), and the records/classes on disk were advanced behind the
+        view — discard pending instead of flushing stale memory over them.
+        """
+        if self._label_panel and self._project:
+            self._label_panel.set_project(self._project, discard_pending=True)
 
     # ── Training ─────────────────────────────────────────────
 
@@ -993,8 +773,7 @@ class MainWindow(QMainWindow):
                 "已有训练任务正在运行，请等待完成或先停止。",
             )
             # Restore button state in case the click slipped through.
-            self._train_panel._btn_start.setEnabled(False)
-            self._train_panel._btn_stop.setEnabled(True)
+            self._train_panel.set_running_state(True)
             return
         # YOLO↔LocateAnything mutual exclusion: training loads CUDA in *this*
         # process, so a resident LA sidecar would contend for the same GPU.
@@ -1005,32 +784,28 @@ class MainWindow(QMainWindow):
             return
         try:
             if self._label_panel:
+                # Keep this explicit flush: downstream DatasetPreparer reads
+                # label files raw (outside the LabelStore) by design.
                 self._label_panel.save_and_cleanup()
 
-            task = self._train_panel._task_combo.currentText()
-            val_ratio = self._train_panel.get_val_ratio()
-            kpt_shape = None
-            if task == "pose":
-                kpt_shape = [self._train_panel._kpt_num_spin.value(), self._train_panel._kpt_dim_spin.value()]
+            req = self._train_panel.get_train_request()
             data_yaml = self._train_ctrl.validate_and_prepare(
-                self._project, task, val_ratio,
-                kpt_shape=kpt_shape,
-                tag_filter=self._train_panel.get_tag_filter(),
+                self._project, req.task, req.val_ratio,
+                kpt_shape=req.kpt_shape,
+                tag_filter=req.tag_filter,
             )
             if data_yaml is None:
-                self._train_panel._btn_start.setEnabled(True)
-                self._train_panel._btn_stop.setEnabled(False)
+                self._train_panel.set_running_state(False)
                 return
 
             config = self._train_panel.get_train_config(data_yaml=data_yaml)
-            base_model = self._train_panel._model_combo.currentText()
-            worker = self._train_ctrl.start(config, self._project, task, base_model=base_model)
+            worker = self._train_ctrl.start(config, self._project, req.task, base_model=req.base_model)
             worker.epoch_update.connect(self._train_panel.update_epoch)
             worker.finished_ok.connect(self._on_training_finished)
             worker.cancelled.connect(self._on_training_cancelled)
             worker.error.connect(self._train_panel.on_training_error)
 
-            self._train_panel.append_log(f"开始训练: {task} | {config.model} | {config.epochs} epochs")
+            self._train_panel.append_log(f"开始训练: {req.task} | {config.model} | {config.epochs} epochs")
         except (OSError, ValueError, RuntimeError) as e:
             logger.error("Failed to start training: %s", e, exc_info=True)
             self._train_panel.on_training_error(str(e))
@@ -1038,8 +813,9 @@ class MainWindow(QMainWindow):
     def _on_stop_training(self) -> None:
         self._train_ctrl.stop()
         if self._train_panel:
+            # The panel's _on_stop already disabled the stop button before
+            # emitting stop_requested — only the log line belongs here.
             self._train_panel.append_log("正在停止训练...")
-            self._train_panel._btn_stop.setEnabled(False)
 
     def _on_training_cancelled(self) -> None:
         if self._train_panel:
@@ -1092,12 +868,13 @@ class MainWindow(QMainWindow):
             return
         # Wait for any in-flight single-image inference (slow backend) so the
         # worker isn't using the predictor while we release it below.
-        if self._single_worker is not None and self._single_worker.isRunning():
-            self._single_worker.wait(30000)
+        self._autolabel_ctrl.shutdown(30000)
         # Free the LocateAnything runtime (GPU model) if it is still resident.
         if self._la_ctrl.is_active:
             self._la_ctrl.disable()
         if self._label_panel:
+            # Keep this explicit flush: persist pending edits before exit —
+            # no store-mediated read runs after this point.
             self._label_panel.save_and_cleanup()
         geo = self.geometry()
         self._app_config.window_geometry = {

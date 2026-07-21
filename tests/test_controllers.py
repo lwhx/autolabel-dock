@@ -135,8 +135,7 @@ class TestProjectController:
             ]
 
     def test_yolo_import_prefers_external_data_yaml_over_project_classes(self, qapp, tmp_path):
-        from src.controllers.project import ProjectController
-        from src.core.config import AppConfig
+        from src.core.formats import get_import_registry
 
         labels_dir = tmp_path / "yolo"
         labels_dir.mkdir()
@@ -148,9 +147,10 @@ class TestProjectController:
             yaml.safe_dump({"names": ["person", "bicycle"], "nc": 2}),
             encoding="utf-8",
         )
-        ctrl = ProjectController(AppConfig(), tmp_path / "cfg.json", QWidget())
 
-        imported = ctrl._invoke_importer("YOLO", str(labels_dir), ["person"])
+        imported = get_import_registry().import_records(
+            "YOLO", str(labels_dir), ["person"]
+        )
 
         assert [ann.class_name for ann in imported[0].annotations] == [
             "person",
@@ -162,6 +162,7 @@ class TestProjectController:
         from src.controllers.project import ProjectController
         from src.core.annotation import ImageAnnotation
         from src.core.config import AppConfig
+        from src.core.formats import get_import_registry
         from src.core.label_io import load_annotation, save_annotation
         from src.core.project import ProjectManager
 
@@ -187,7 +188,7 @@ class TestProjectController:
         ctrl.open_project(pm.project_dir)
 
         with patch("src.controllers.project.ImportDialog") as DlgMock, \
-                patch.object(ctrl, "_invoke_importer", return_value=imported), \
+                patch.object(get_import_registry(), "import_records", return_value=imported), \
                 patch.object(ctrl, "create_backup"), \
                 patch("src.controllers.project.QMessageBox"):
             dlg = MagicMock()
@@ -206,6 +207,7 @@ class TestProjectController:
         from src.controllers.project import ProjectController
         from src.core.annotation import ImageAnnotation
         from src.core.config import AppConfig
+        from src.core.formats import get_import_registry
         from src.core.label_io import load_annotation, save_annotation
         from src.core.project import ProjectManager
 
@@ -230,7 +232,7 @@ class TestProjectController:
         ctrl.open_project(pm.project_dir)
 
         with patch("src.controllers.project.ImportDialog") as DlgMock, \
-                patch.object(ctrl, "_invoke_importer", return_value=imported), \
+                patch.object(get_import_registry(), "import_records", return_value=imported), \
                 patch.object(ctrl, "create_backup"), \
                 patch("src.controllers.project.QMessageBox"):
             dlg = MagicMock()
@@ -865,9 +867,14 @@ class TestPreviewModelClasses:
         return ctrl
 
     def _make_predictor(self, names):
-        pred = MagicMock()
-        pred.model.names = names
-        return pred
+        # Wrap a real Predictor so class_names() does the dict/list resolution
+        # (the seam that moved out of the controller); the mock only supplies
+        # model.names. This keeps preview_model_classes tested end-to-end.
+        from src.engine.predictor import Predictor
+
+        model = MagicMock()
+        model.names = names
+        return Predictor(model)
 
     def test_returns_only_new_classes(self, qapp, tmp_path):
         ctrl = self._make_controller(qapp, tmp_path, classes=["cat"])
@@ -898,9 +905,10 @@ class TestPreviewModelClasses:
         assert ctrl.preview_model_classes(None) == []
 
     def test_predictor_without_names_returns_empty(self, qapp, tmp_path):
+        from src.engine.predictor import Predictor
+
         ctrl = self._make_controller(qapp, tmp_path)
-        pred = MagicMock()
-        pred.model = MagicMock(spec=[])  # no .names attribute
+        pred = Predictor(MagicMock(spec=[]))  # model has no .names attribute
         assert ctrl.preview_model_classes(pred) == []
 
     def test_empty_model_names_returns_empty(self, qapp, tmp_path):

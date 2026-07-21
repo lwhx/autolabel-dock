@@ -211,3 +211,32 @@ def test_release_terminates_worker():
 def test_release_without_worker_is_noop():
     pred = LocateAnythingPredictor(worker=None)
     pred.release()  # must not raise
+
+
+# ── PredictorProtocol capability seam (class_names / last_dropped) ─────────
+
+
+def test_class_names_is_empty_open_vocabulary():
+    """LA is open-vocabulary: it advertises no fixed class list."""
+    pred, _ = _make_predictor("")
+    assert pred.class_names() == []
+
+
+def test_last_dropped_defaults_zero_before_any_predict():
+    pred = LocateAnythingPredictor(worker=None)
+    assert pred.last_dropped == 0
+
+
+def test_both_adapters_satisfy_capability_seam():
+    """Both concrete predictors expose class_names() + last_dropped so no
+    call-site needs getattr probing (PredictorProtocol capability seam)."""
+    from unittest.mock import MagicMock
+
+    from src.engine.predictor import Predictor
+
+    yolo = Predictor(MagicMock())
+    la, _ = _make_predictor("")
+    for pred in (yolo, la):
+        assert callable(pred.class_names)
+        assert isinstance(pred.class_names(), list)
+        assert isinstance(pred.last_dropped, int)

@@ -92,6 +92,19 @@ class PredictorProtocol(Protocol):
     ) -> tuple[str, float] | None:
         ...
 
+    def class_names(self) -> list[str]:
+        """Class names this predictor can emit. Fixed-vocabulary backends
+        (YOLO) return their model's class list; open-vocabulary backends
+        (LocateAnything) return [] (no fixed vocabulary)."""
+        ...
+
+    @property
+    def last_dropped(self) -> int:
+        """Count of detections dropped by name-matching on the most recent
+        predict call (open-vocabulary backends). 0 for fixed-vocabulary
+        backends (YOLO never drops on a name mismatch)."""
+        ...
+
     def release(self) -> None:
         """Optional: free model + GPU memory. No-op for in-process backends
         that don't hold scarce GPU resources (e.g. Ultralytics)."""

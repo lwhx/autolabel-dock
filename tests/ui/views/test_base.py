@@ -34,6 +34,25 @@ def test_task_view_default_methods_raise(qapp):
         view.add_auto_class_prediction(None, "x", 0.0)
 
 
+def test_task_view_default_noop_members(qapp):
+    """Optional-override members must be safe no-ops on the base class
+    (same pattern as set_tag_filter): views that don't care never implement
+    them, and shell/controller callers never need hasattr checks."""
+    from src.ui.views.base import TaskView
+
+    view = TaskView()
+    assert view.set_available_tags([]) is None
+    assert view.set_tag_filter(None) is None
+    assert view.get_selected_image_paths() == []
+    assert view.refresh_image_tags(None, []) is None
+    assert view.set_image_status(None, "pending") is None
+    assert view.cleanup() is None
+    # None (not {}) is the "view holds no panel state" sentinel — the shell
+    # falls back to its pending copy only on None.
+    assert view.save_annotation_panel_state() is None
+    assert view.restore_annotation_panel_state({"sizes": [1, 2]}) is None
+
+
 def test_task_view_signals_exist(qapp):
     from src.ui.views.base import TaskView
 

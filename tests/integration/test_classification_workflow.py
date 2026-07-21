@@ -438,7 +438,7 @@ class _FakeClassifyPredictor:
     """Test double for Predictor that returns a configured (class_name, conf).
 
     Mimics the parts of Predictor that BatchPredictWorker / ProjectController
-    consume: ``model.names`` for preview_model_classes and ``predict_classify``
+    consume: ``class_names()`` for preview_model_classes and ``predict_classify``
     for the worker hot loop.
     """
 
@@ -448,6 +448,11 @@ class _FakeClassifyPredictor:
         self.model = MagicMock()
         self.model.names = names
         self._mapping = mapping
+
+    def class_names(self):
+        # Reuse the real seam so the double resolves model.names identically.
+        from src.engine.predictor import Predictor
+        return Predictor.class_names(self)
 
     def predict_classify(self, image_path, project_classes=None, filter_to_project=True):
         stem = Path(image_path).stem
