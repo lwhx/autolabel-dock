@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from dataclasses import dataclass
 
 from PyQt5.QtWidgets import (
     QWidget,
@@ -35,6 +36,12 @@ from src.engine.trainer import (
 )
 from src.core.train_templates import TemplateRegistry
 from src.core.tags import TagFilter
+from src.core.train_metrics import (
+    TASK_QUALITY_METRICS,
+    build_quality_series,
+    build_series,
+)
+from src.ui import train_form_binding
 from src.ui.icons import icon
 from src.ui.tag_widget import TagFilterBar
 from src.ui.theme import PALETTE, set_button_role, text_style
@@ -77,118 +84,38 @@ _TASK_MODELS: dict[str, list[str]] = {
     "obb": ["yolov8n-obb.pt", "yolov8s-obb.pt", "yolov8m-obb.pt", "yolov8l-obb.pt", "yolov8x-obb.pt"],
 }
 
-# Mapping from TrainConfig field names to spinbox/checkbox attribute names on TrainPanel.
-# Special-cased fields (freeze, auto_augment, model, kpt_shape) handled in apply_template_params.
-_NUMERIC_FIELD_MAP: dict[str, str] = {
-    "epochs": "_epochs_spin",
-    "batch": "_batch_spin",
-    "imgsz": "_imgsz_spin",
-    "workers": "_workers_spin",
-    "patience": "_patience_spin",
-    "lr0": "_lr0_spin",
-    "lrf": "_lrf_spin",
-    "momentum": "_momentum_spin",
-    "weight_decay": "_weight_decay_spin",
-    "warmup_epochs": "_warmup_epochs_spin",
-    "warmup_momentum": "_warmup_momentum_spin",
-    "warmup_bias_lr": "_warmup_bias_lr_spin",
-    "hsv_h": "_hsv_h_spin",
-    "hsv_s": "_hsv_s_spin",
-    "hsv_v": "_hsv_v_spin",
-    "degrees": "_degrees_spin",
-    "translate": "_translate_spin",
-    "scale": "_scale_spin",
-    "shear": "_shear_spin",
-    "perspective": "_perspective_spin",
-    "flipud": "_flipud_spin",
-    "fliplr": "_fliplr_spin",
-    "mosaic": "_mosaic_spin",
-    "mixup": "_mixup_spin",
-    "copy_paste": "_copy_paste_spin",
-    "erasing": "_erasing_spin",
-    "dropout": "_dropout_spin",
-    "pose": "_pose_weight_spin",
-    "kobj": "_kobj_spin",
-}
 
-_BOOL_FIELD_MAP: dict[str, str] = {
-    "include_detect_params": "_include_detect_params_check",
-    "include_classify_params": "_include_classify_params_check",
-    "include_pose_params": "_include_pose_params_check",
-}
+@dataclass(frozen=True)
+class TrainRequest:
+    """Snapshot of everything MainWindow needs to orchestrate a training start.
 
-_COMBO_FIELD_MAP: dict[str, str] = {
-    "optimizer": "_optimizer_combo",
-    "device": "_device_combo",
-}
+    Read via :meth:`TrainPanel.get_train_request` — the single public request
+    face replacing piecemeal reads of the panel's private widgets. Base-model
+    path resolution still happens inside :meth:`TrainPanel.get_train_config`;
+    ``base_model`` here is the combo's display name (used as the registration
+    label).
+    """
 
-
-# Quality metric per task: (display title, list of (curve label, metric-key candidates))
-# The first key that appears in the emitted metrics dict wins.
-_TASK_QUALITY_METRICS: dict[str, tuple[str, list[tuple[str, list[str]]]]] = {
-    "detect": (
-        "mAP",
-        [
-            ("mAP50", ["metrics/mAP50(B)", "mAP50"]),
-            ("mAP50-95", ["metrics/mAP50-95(B)", "mAP50-95"]),
-        ],
-    ),
-    "pose": (
-        "mAP (Pose)",
-        [
-            ("Pose mAP50", ["metrics/mAP50(P)", "metrics/mAP50(B)"]),
-            ("Pose mAP50-95", ["metrics/mAP50-95(P)", "metrics/mAP50-95(B)"]),
-        ],
-    ),
-    "classify": (
-        "Accuracy",
-        [
-            ("Top-1", ["metrics/accuracy_top1", "accuracy_top1"]),
-            ("Top-5", ["metrics/accuracy_top5", "accuracy_top5"]),
-        ],
-    ),
-}
-
-
-def _pick_metric(metrics: dict, candidates: list[str]) -> float | None:
-    """Return the first matching numeric value among candidate keys, else None."""
-    for key in candidates:
-        if key in metrics:
-            try:
-                return float(metrics[key])
-            except (TypeError, ValueError):
-                continue
-    return None
-
-
-def _compute_val_loss(metrics: dict) -> float | None:
-    """Sum all val/* loss-like keys. Falls back to legacy 'val_loss' if present."""
-    if "val_loss" in metrics:
-        try:
-            return float(metrics["val_loss"])
-        except (TypeError, ValueError):
-            pass
-    total = 0.0
-    found = False
-    for k, v in metrics.items():
-        if k.startswith("val/") and "loss" in k.lower():
-            try:
-                total += float(v)
-                found = True
-            except (TypeError, ValueError):
-                continue
-    return total if found else None
+    task: str
+    kpt_shape: list[int] | None  # [num, dim] only when task == "pose", else None
+    val_ratio: float
+    tag_filter: TagFilter
+    base_model: str
 
 
 class TrainPanel(QWidget):
     """Training panel with parameter configuration and monitoring.
 
     Signals:
-        start_requested(TrainConfig): User clicked start training.
+        start_requested(): User clicked start training. Emitted at the END of
+            the panel's own ``_on_start`` slot — the panel has already flipped
+            itself to the running state, so orchestration (MainWindow) runs
+            strictly after the visual flip and may call
+            ``set_running_state(False)`` to restore idle on abort.
         stop_requested(): User clicked stop training.
     """
 
-    start_requested = pyqtSignal(object)  # TrainConfig
+    start_requested = pyqtSignal()
     stop_requested = pyqtSignal()
     preview_augmentation_requested = pyqtSignal(dict)  # augmentation params dict
     filter_changed = pyqtSignal(object)  # TagFilter — re-emitted from inner TagFilterBar
@@ -769,7 +696,7 @@ class TrainPanel(QWidget):
         except ImportError:
             return
 
-        title, specs = _TASK_QUALITY_METRICS.get(task, _TASK_QUALITY_METRICS["detect"])
+        title, specs = TASK_QUALITY_METRICS.get(task, TASK_QUALITY_METRICS["detect"])
         self._quality_plot.setTitle(title)
         # Clear previous curves (both data and legend entries).
         self._quality_plot.clear()
@@ -918,34 +845,9 @@ class TrainPanel(QWidget):
 
     def apply_template_params(self, params: dict) -> None:
         """Set spin/check/combo values for keys present in `params`. Missing keys leave UI alone.
-        Unknown keys are skipped with a warning log."""
-        for key, value in params.items():
-            if key in _NUMERIC_FIELD_MAP:
-                getattr(self, _NUMERIC_FIELD_MAP[key]).setValue(value)
-            elif key in _BOOL_FIELD_MAP:
-                getattr(self, _BOOL_FIELD_MAP[key]).setChecked(bool(value))
-            elif key in _COMBO_FIELD_MAP:
-                combo = getattr(self, _COMBO_FIELD_MAP[key])
-                text = str(value) if value is not None else ""
-                if key == "device" and text == "":
-                    text = "auto"
-                combo.setCurrentText(text)
-            elif key == "freeze":
-                self._set_freeze_value(value)
-            elif key == "auto_augment":
-                text = value if value else "none"
-                idx = self._auto_augment_combo.findText(text)
-                if idx >= 0:
-                    self._auto_augment_combo.setCurrentIndex(idx)
-            elif key == "model":
-                # Editable combo — accept arbitrary string
-                self._model_combo.setCurrentText(str(value))
-            elif key == "kpt_shape":
-                if isinstance(value, (list, tuple)) and len(value) == 2:
-                    self._kpt_num_spin.setValue(int(value[0]))
-                    self._kpt_dim_spin.setValue(int(value[1]))
-            else:
-                logger.warning("Skipping unknown template key: %s", key)
+        Unknown keys are skipped with a warning log. Mapping + special cases
+        live in :mod:`src.ui.train_form_binding` (duck-typed on this panel)."""
+        train_form_binding.apply_template_params(self, params)
 
     def get_train_template_params(self) -> dict:
         """Read current UI state into a task-relevant params dict."""
@@ -970,6 +872,10 @@ class TrainPanel(QWidget):
             self._val_loss_curve.setData([], [])
         for curve, _ in self._quality_curves:
             curve.setData([], [])
+        # Emit LAST: the panel must already be in the running state when
+        # orchestration (MainWindow._on_start_training) runs, so an aborted
+        # launch can restore idle via set_running_state(False).
+        self.start_requested.emit()
 
     def _on_stop(self) -> None:
         # Keep the start button disabled (still labelled "训练中") until the
@@ -1085,6 +991,36 @@ class TrainPanel(QWidget):
         """
         return self._tag_filter_bar.current_filter()
 
+    def get_train_request(self) -> TrainRequest:
+        """Snapshot the form into a :class:`TrainRequest`.
+
+        The single public read MainWindow needs to orchestrate a training
+        start (validate/prepare + registration label) — replaces piecemeal
+        reads of ``_task_combo`` / ``_kpt_num_spin`` / ``_model_combo``.
+        ``kpt_shape`` is populated only for the pose task.
+        """
+        task = self._task_combo.currentText()
+        kpt_shape = None
+        if task == "pose":
+            kpt_shape = [self._kpt_num_spin.value(), self._kpt_dim_spin.value()]
+        return TrainRequest(
+            task=task,
+            kpt_shape=kpt_shape,
+            val_ratio=self.get_val_ratio(),
+            tag_filter=self.get_tag_filter(),
+            base_model=self._model_combo.currentText(),
+        )
+
+    def set_task_type(self, task: str) -> None:
+        """Select the training task ("detect" | "classify" | "pose").
+
+        Thin delegate to the task combo so the regular ``_on_task_changed``
+        cascade fires (augmentation groups, model list, quality curves,
+        template combo). Qt semantics preserved: setting the already-current
+        text does not re-fire the cascade.
+        """
+        self._task_combo.setCurrentText(task)
+
     def set_filter_breakdown(self, counts: dict[str, int] | None) -> None:
         """Render the tag-filter diagnostic label.
 
@@ -1135,32 +1071,16 @@ class TrainPanel(QWidget):
                 parts.append(f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}")
         self.append_log(" | ".join(parts))
 
-        # Update curves
+        # Update curves — series math (incl. carry-forward for epochs without
+        # val/quality metrics) lives in src/core/train_metrics.py.
         if self._loss_plot is None:
             return
-        epochs = list(range(1, len(self._epoch_data) + 1))
-        train_losses = [float(d.get("train_loss", 0) or 0) for d in self._epoch_data]
-        val_losses_raw = [_compute_val_loss(d) for d in self._epoch_data]
-        # Carry forward last known val_loss so the line doesn't dip to 0 on
-        # epochs that have no val metrics (some tasks only validate periodically).
-        last_val = 0.0
-        val_losses: list[float] = []
-        for v in val_losses_raw:
-            if v is not None:
-                last_val = v
-            val_losses.append(last_val)
-        self._train_loss_curve.setData(epochs, train_losses)
-        self._val_loss_curve.setData(epochs, val_losses)
+        series = build_series(self._epoch_data)
+        self._train_loss_curve.setData(series.epochs, series.train_losses)
+        self._val_loss_curve.setData(series.epochs, series.val_losses)
 
         for curve, keys in self._quality_curves:
-            last = 0.0
-            ys: list[float] = []
-            for d in self._epoch_data:
-                v = _pick_metric(d, keys)
-                if v is not None:
-                    last = v
-                ys.append(last)
-            curve.setData(epochs, ys)
+            curve.setData(series.epochs, build_quality_series(self._epoch_data, keys))
 
     def on_training_finished(self, metrics: dict) -> None:
         """Handle training completion."""
@@ -1197,6 +1117,25 @@ class TrainPanel(QWidget):
         self._btn_start.setText("开始训练")
         self._btn_stop.setEnabled(False)
         self._epoch_progress.setVisible(False)
+
+    def set_running_state(self, running: bool) -> None:
+        """Public running-state switch for orchestration code (MainWindow).
+
+        ``True`` re-asserts the running visuals (start disabled + "训练中",
+        stop enabled) — used by the "training already running" guard when a
+        stray click slipped through. ``False`` is the full idle restore
+        (buttons, label text, progress bar) via
+        :meth:`reset_start_button_idle` — used when a launch aborts after
+        ``_on_start`` already flipped the panel (e.g. dataset validation
+        failed). Converges the former three private restore paths into one
+        public method.
+        """
+        if running:
+            self._btn_start.setEnabled(False)
+            self._btn_start.setText("训练中")
+            self._btn_stop.setEnabled(True)
+        else:
+            self.reset_start_button_idle()
 
     def on_training_error(self, error_msg: str) -> None:
         """Handle training error."""

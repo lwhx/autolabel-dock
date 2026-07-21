@@ -691,3 +691,93 @@ def test_train_panel_set_filter_breakdown_all_zero_is_hidden(qapp):
         {"match": 0, "excluded": 0, "no_include": 0, "conflict": 0}
     )
     assert panel._filter_breakdown_label.isHidden()
+
+
+class TestTrainPanelSeam:
+    """Public seam: TrainRequest, running-state, task-type, start_requested."""
+
+    def test_get_train_request_detect_has_no_kpt_shape(self, qapp):
+        from src.ui.train_panel import TrainPanel, TrainRequest
+
+        panel = TrainPanel()
+        panel.set_task_type("detect")
+        panel._val_ratio_spin.setValue(0.3)
+        panel._model_combo.setCurrentText("yolov8n.pt")
+
+        req = panel.get_train_request()
+        assert isinstance(req, TrainRequest)
+        assert req.task == "detect"
+        assert req.kpt_shape is None
+        assert req.val_ratio == 0.3
+        assert req.base_model == "yolov8n.pt"
+        assert req.tag_filter.is_empty()
+
+    def test_get_train_request_pose_carries_kpt_shape(self, qapp):
+        from src.ui.train_panel import TrainPanel
+
+        panel = TrainPanel()
+        panel.set_task_type("pose")
+        panel._kpt_num_spin.setValue(21)
+        panel._kpt_dim_spin.setValue(2)
+
+        req = panel.get_train_request()
+        assert req.task == "pose"
+        assert req.kpt_shape == [21, 2]
+
+    def test_set_running_state_true_shows_running_visuals(self, qapp):
+        from src.ui.train_panel import TrainPanel
+
+        panel = TrainPanel()
+        panel.set_running_state(True)
+        assert panel._btn_start.isEnabled() is False
+        assert panel._btn_start.text() == "训练中"
+        assert panel._btn_stop.isEnabled() is True
+
+    def test_set_running_state_false_restores_idle(self, qapp):
+        from src.ui.train_panel import TrainPanel
+
+        panel = TrainPanel()
+        panel.set_running_state(True)
+        panel._epoch_progress.setVisible(True)
+
+        panel.set_running_state(False)
+        assert panel._btn_start.isEnabled() is True
+        assert panel._btn_start.text() == "开始训练"
+        assert panel._btn_stop.isEnabled() is False
+        assert panel._epoch_progress.isHidden()
+
+    def test_set_task_type_switches_model_list(self, qapp):
+        from src.ui.train_panel import TrainPanel
+
+        panel = TrainPanel()
+        panel.set_task_type("classify")
+        items = [panel._model_combo.itemText(i) for i in range(panel._model_combo.count())]
+        assert any("cls" in it for it in items)
+        assert panel._task_combo.currentText() == "classify"
+
+    def test_on_start_emits_start_requested_after_flipping_running(self, qapp):
+        from src.ui.train_panel import TrainPanel
+
+        panel = TrainPanel()
+        states: list = []
+        # Capture the panel's button state at the instant the signal fires —
+        # it must already be flipped to running (先翻态后编排).
+        panel.start_requested.connect(
+            lambda: states.append(
+                (panel._btn_start.isEnabled(), panel._btn_start.text(), panel._btn_stop.isEnabled())
+            )
+        )
+
+        panel._btn_start.click()
+
+        assert states == [(False, "训练中", True)]
+
+    def test_start_requested_is_parameterless(self, qapp):
+        from src.ui.train_panel import TrainPanel
+
+        panel = TrainPanel()
+        received: list = []
+        panel.start_requested.connect(lambda *a: received.append(a))
+        panel._on_start()
+        assert received == [()]
+

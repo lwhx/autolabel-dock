@@ -9,7 +9,7 @@ import yaml
 from PyQt5.QtWidgets import QWidget, QMessageBox
 
 from src.core.project import ProjectManager
-from src.core.label_io import load_annotation
+from src.core.label_store import LabelStore
 from src.core.tags import TagFilter
 from src.engine.backends import get_backend
 from src.engine.dataset import DatasetPreparer
@@ -23,8 +23,11 @@ logger = logging.getLogger(__name__)
 class TrainController:
     """Handles training lifecycle: validation, start, stop, model registration."""
 
-    def __init__(self, parent_widget: QWidget):
+    def __init__(self, parent_widget: QWidget, label_store: LabelStore | None = None):
         self._parent = parent_widget
+        # Shared LabelStore (MainWindow-owned): validation counting reads
+        # through it so pending edits are flushed before the tally.
+        self._store = label_store or LabelStore()
         self._worker: TrainWorker | None = None
         self._run_name: str = ""
         self._dataset_size: int = 0
@@ -69,7 +72,7 @@ class TrainController:
 
         for img_path in project.list_images():
             label_path = project.label_path_for(img_path)
-            ia = load_annotation(label_path)
+            ia = self._store.load(label_path)
             if ia is None:
                 continue
             if tag_filter is not None and not tag_filter.matches(ia.tags):
